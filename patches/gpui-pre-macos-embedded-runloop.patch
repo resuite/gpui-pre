@@ -1,0 +1,478 @@
+diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/platform.rs
+--- /tmp/gpui-pre-macos-upstream/src/platform.rs	2006-07-24 02:21:28
++++ vendor/gpui-pre-macos/src/platform.rs	2026-09-09 08:08:44
+@@ -9,12 +9,14 @@
+     appkit::{
+         NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
+         NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular, NSControl as _,
+-        NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSSavePanel,
+-        NSVisualEffectState, NSVisualEffectView, NSWindow,
++        NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType, NSMenu, NSMenuItem,
++        NSModalResponse, NSOpenPanel, NSSavePanel, NSVisualEffectState, NSVisualEffectView,
++        NSWindow,
+     },
+     base::{BOOL, NO, YES, id, nil, selector},
+     foundation::{
+-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSProcessInfo, NSString, NSUInteger, NSURL,
++        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSString,
++        NSUInteger, NSURL,
+     },
+ };
+ use core_foundation::{
+@@ -22,7 +24,7 @@
+     boolean::CFBoolean,
+     data::CFData,
+     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
+-    runloop::CFRunLoopRun,
++    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
+     string::{CFString, CFStringRef},
+ };
+ use ctor::ctor;
+@@ -58,7 +60,7 @@
+     slice, str,
+     sync::{
+         Arc, OnceLock,
+-        atomic::{AtomicBool, Ordering},
++        atomic::{AtomicBool, AtomicPtr, Ordering},
+     },
+ };
+ 
+@@ -68,6 +70,7 @@
+ const MAC_PLATFORM_IVAR: &str = "platform";
+ static mut APP_CLASS: *const Class = ptr::null();
+ static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
++static REGISTERED_MAC_PLATFORM: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+ 
+ #[ctor(unsafe)]
+ unsafe fn build_classes() {
+@@ -166,12 +169,27 @@
+ 
+ pub struct MacPlatform(Mutex<MacPlatformState>, MainThreadMarker);
+ 
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum MacPlatformMode {
++    Blocking,
++    Embedded(EmbeddedLifecycle),
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum EmbeddedLifecycle {
++    Ready,
++    Running,
++    Launched,
++    Terminated,
++}
++
+ pub(crate) struct MacPlatformState {
+     background_executor: BackgroundExecutor,
+     foreground_executor: ForegroundExecutor,
+     text_system: Arc<dyn PlatformTextSystem>,
+     renderer_context: renderer::Context,
+     headless: bool,
++    mode: MacPlatformMode,
+     general_pasteboard: Pasteboard,
+     find_pasteboard: Pasteboard,
+     reopen: Option<Box<dyn FnMut()>>,
+@@ -217,6 +235,7 @@
+ 
+         let state = Mutex::new(MacPlatformState {
+             headless,
++            mode: MacPlatformMode::Blocking,
+             text_system,
+             background_executor: BackgroundExecutor::new(dispatcher.clone()),
+             foreground_executor: ForegroundExecutor::new(dispatcher),
+@@ -244,6 +263,100 @@
+         Self(state, marker)
+     }
+ 
++    /// Creates a platform whose AppKit loop is driven by a foreign main loop.
++    pub fn new_embedded() -> Self {
++        let platform = Self::new(false);
++        platform.0.lock().mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Ready);
++        platform
++    }
++
++    /// Processes only AppKit work that is ready now and returns immediately.
++    pub fn pump_events(&self) -> bool {
++        {
++            let mut state = self.0.lock();
++            match state.mode {
++                MacPlatformMode::Blocking => panic!("pump_events requires new_embedded"),
++                MacPlatformMode::Embedded(EmbeddedLifecycle::Ready) => {
++                    panic!("pump_events requires Platform::run first")
++                }
++                MacPlatformMode::Embedded(EmbeddedLifecycle::Running) => {
++                    panic!("pump_events must not run re-entrantly")
++                }
++                MacPlatformMode::Embedded(EmbeddedLifecycle::Launched) => {
++                    state.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Running);
++                }
++                MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => return false,
++            }
++        }
++
++        unsafe {
++            let pool = NSAutoreleasePool::new(nil);
++            pump_app_nonblocking();
++            pool.drain();
++        }
++        self.finish_embedded_run()
++    }
++
++    fn finish_embedded_run(&self) -> bool {
++        let mut state = self.0.lock();
++        match state.mode {
++            MacPlatformMode::Embedded(EmbeddedLifecycle::Running) => {
++                state.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Launched);
++                true
++            }
++            MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated) => false,
++            _ => unreachable!("embedded event loop returned from an invalid state"),
++        }
++    }
++
++    unsafe fn register_with_appkit(&self, app: id, delegate: id) {
++        unsafe {
++            let self_ptr = self as *const Self as *mut c_void;
++            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
++            (*delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
++            REGISTERED_MAC_PLATFORM.store(self_ptr, Ordering::Release);
++        }
++    }
++
++    unsafe fn clear_appkit_registration(&self) {
++        unsafe {
++            let self_ptr = self as *const Self as *mut c_void;
++            if REGISTERED_MAC_PLATFORM
++                .compare_exchange(
++                    self_ptr,
++                    ptr::null_mut(),
++                    Ordering::AcqRel,
++                    Ordering::Acquire,
++                )
++                .is_err()
++            {
++                return;
++            }
++
++            let app: id = msg_send![APP_CLASS, sharedApplication];
++            if app == nil {
++                return;
++            }
++            if *(*app).get_ivar::<*mut c_void>(MAC_PLATFORM_IVAR) == self_ptr {
++                (*app).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++            }
++
++            let delegate = NSWindow::delegate(app);
++            if delegate == nil
++                || *(*delegate).get_ivar::<*mut c_void>(MAC_PLATFORM_IVAR) != self_ptr
++            {
++                return;
++            }
++
++            let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
++            let _: () = msg_send![notification_center, removeObserver: delegate];
++            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
++            let workspace_center: id = msg_send![workspace, notificationCenter];
++            let _: () = msg_send![workspace_center, removeObserver: delegate];
++            (*delegate).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++        }
++    }
++
+     unsafe fn create_menu_bar(
+         &self,
+         menus: &Vec<Menu>,
+@@ -478,6 +591,73 @@
+     }
+ }
+ 
++unsafe fn pump_app_nonblocking() {
++    unsafe {
++        let app: id = msg_send![APP_CLASS, sharedApplication];
++        let distant_past: id = msg_send![class!(NSDate), distantPast];
++        let mode = kCFRunLoopDefaultMode as id;
++
++        for _ in 0..256 {
++            let event: id = msg_send![app,
++                nextEventMatchingMask: NSUInteger::MAX
++                untilDate: distant_past
++                inMode: mode
++                dequeue: YES
++            ];
++            if event == nil {
++                break;
++            }
++            let _: () = msg_send![app, sendEvent: event];
++        }
++        let _: () = msg_send![app, updateWindows];
++        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
++    }
++}
++
++unsafe fn post_wake_event() {
++    unsafe {
++        let app: id = msg_send![APP_CLASS, sharedApplication];
++        let event = <id as NSEvent>::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
++            nil,
++            NSEventType::NSApplicationDefined,
++            NSPoint::new(0.0, 0.0),
++            NSEventModifierFlags::empty(),
++            0.0,
++            0,
++            nil,
++            NSEventSubtype::NSWindowExposedEventType,
++            0,
++            0,
++        );
++        if event != nil {
++            app.postEvent_atStart_(event, YES);
++        }
++    }
++}
++
++unsafe fn stop_app_immediately() {
++    unsafe {
++        let app: id = msg_send![APP_CLASS, sharedApplication];
++        app.stop_(nil);
++        post_wake_event();
++    }
++}
++
++fn registered_mac_platform(context: *mut c_void) -> Option<&'static MacPlatform> {
++    let registered = REGISTERED_MAC_PLATFORM.load(Ordering::Acquire);
++    if registered.is_null() || registered != context {
++        None
++    } else {
++        Some(unsafe { &*(registered as *const MacPlatform) })
++    }
++}
++
++impl Drop for MacPlatform {
++    fn drop(&mut self) {
++        unsafe { self.clear_appkit_registration() }
++    }
++}
++
+ impl Platform for MacPlatform {
+     fn background_executor(&self) -> BackgroundExecutor {
+         self.0.lock().background_executor.clone()
+@@ -493,6 +673,15 @@
+ 
+     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+         let mut state = self.0.lock();
++        let embedded = match state.mode {
++            MacPlatformMode::Blocking => false,
++            MacPlatformMode::Embedded(EmbeddedLifecycle::Ready) => {
++                state.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Running);
++                true
++            }
++            MacPlatformMode::Embedded(_) => panic!("embedded MacPlatform can only run once"),
++        };
++
+         if state.headless {
+             drop(state);
+             on_finish_launching();
+@@ -506,17 +695,17 @@
+             let app: id = msg_send![APP_CLASS, sharedApplication];
+             let app_delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+             app.setDelegate_(app_delegate);
++            self.register_with_appkit(app, app_delegate);
+ 
+-            let self_ptr = self as *const Self as *const c_void;
+-            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
+-            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
+-
+             let pool = NSAutoreleasePool::new(nil);
+             app.run();
+             pool.drain();
+ 
+-            (*app).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
+-            (*NSWindow::delegate(app)).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
++            if embedded {
++                self.finish_embedded_run();
++            } else {
++                self.clear_appkit_registration();
++            }
+         }
+     }
+ 
+@@ -1257,11 +1446,10 @@
+     PathBuf::from(path)
+ }
+ 
+-unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
++unsafe fn get_mac_platform(object: &mut Object) -> Option<&MacPlatform> {
+     unsafe {
+         let platform_ptr: *mut c_void = *object.get_ivar(MAC_PLATFORM_IVAR);
+-        assert!(!platform_ptr.is_null());
+-        &*(platform_ptr as *const MacPlatform)
++        (!platform_ptr.is_null()).then(|| &*(platform_ptr as *const MacPlatform))
+     }
+ }
+ 
+@@ -1305,18 +1493,26 @@
+         ];
+ 
+         let observer = this as *mut Object as id;
+-        let platform = get_mac_platform(this);
+-        let callback = {
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
++        let (callback, embedded) = {
+             let mut state = platform.0.lock();
+             if state.on_system_wake.is_some() && !state.system_wake_observer_registered {
+                 register_system_wake_observer(observer);
+                 state.system_wake_observer_registered = true;
+             }
+-            state.finish_launching.take()
++            (
++                state.finish_launching.take(),
++                matches!(state.mode, MacPlatformMode::Embedded(_)),
++            )
+         };
+         if let Some(callback) = callback {
+             callback();
+         }
++        if embedded {
++            stop_app_immediately();
++        }
+     }
+ }
+ 
+@@ -1336,7 +1532,9 @@
+ 
+ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
+     if !has_open_windows {
+-        let platform = unsafe { get_mac_platform(this) };
++        let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.reopen.take() {
+             drop(lock);
+@@ -1347,8 +1545,13 @@
+ }
+ 
+ extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
++    if matches!(lock.mode, MacPlatformMode::Embedded(_)) {
++        lock.mode = MacPlatformMode::Embedded(EmbeddedLifecycle::Terminated);
++    }
+     if let Some(mut callback) = lock.quit.take() {
+         drop(lock);
+         callback();
+@@ -1357,7 +1560,9 @@
+ }
+ 
+ extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
+     let keyboard_layout = MacKeyboardLayout::new();
+     lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+@@ -1376,14 +1581,18 @@
+     // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
+     // as NSNotificationCenter delivers this notification synchronously and it may fire while
+     // the App is already borrowed (same pattern as quit() above).
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let platform_ptr = platform as *const MacPlatform as *mut c_void;
+     unsafe {
+         DispatchQueue::main().exec_async_f(platform_ptr, on_thermal_state_change);
+     }
+ 
+     extern "C" fn on_thermal_state_change(context: *mut c_void) {
+-        let platform = unsafe { &*(context as *const MacPlatform) };
++        let Some(platform) = registered_mac_platform(context) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.on_thermal_state_change.take() {
+             drop(lock);
+@@ -1399,7 +1608,9 @@
+ 
+ extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
+     // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let platform_ptr = platform as *const MacPlatform as *mut c_void;
+     // SAFETY: platform lives for the process lifetime while callbacks are registered.
+     unsafe {
+@@ -1407,8 +1618,9 @@
+     }
+ 
+     extern "C" fn on_system_wake(context: *mut c_void) {
+-        // SAFETY: context is the MacPlatform pointer queued above.
+-        let platform = unsafe { &*(context as *const MacPlatform) };
++        let Some(platform) = registered_mac_platform(context) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.on_system_wake.take() {
+             drop(lock);
+@@ -1433,7 +1645,9 @@
+             })
+             .collect::<Vec<_>>()
+     };
+-    let platform = unsafe { get_mac_platform(this) };
++    let Some(platform) = (unsafe { get_mac_platform(this) }) else {
++        return;
++    };
+     let mut lock = platform.0.lock();
+     if let Some(mut callback) = lock.open_urls.take() {
+         drop(lock);
+@@ -1444,7 +1658,9 @@
+ 
+ extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.menu_command.take() {
+             let tag: NSInteger = msg_send![item, tag];
+@@ -1462,7 +1678,9 @@
+ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
+     unsafe {
+         let mut result = false;
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return false;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.validate_menu_command.take() {
+             let tag: NSInteger = msg_send![item, tag];
+@@ -1484,7 +1702,9 @@
+ 
+ extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return;
++        };
+         let mut lock = platform.0.lock();
+         if let Some(mut callback) = lock.will_open_menu.take() {
+             drop(lock);
+@@ -1496,7 +1716,9 @@
+ 
+ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
+     unsafe {
+-        let platform = get_mac_platform(this);
++        let Some(platform) = get_mac_platform(this) else {
++            return nil;
++        };
+         let state = platform.0.lock();
+         if let Some(id) = state.dock_menu {
+             id

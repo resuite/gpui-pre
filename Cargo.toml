@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/gpui-pre-macos"]
+resolver = "2"
