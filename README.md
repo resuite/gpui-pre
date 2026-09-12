@@ -7,7 +7,7 @@ This repository is not Zed and it is not Retend. It exists so Retend can depend 
 ## Current crates
 
 - `crates/gpui-pre-macos` — `gpui-pre-macos` 0.3.4 plus an embedded NSApplication / CFRunLoop pump in `src/platform.rs`
-- `crates/gpui-pre` — `gpui-pre` 0.3.4 snapshot
+- `crates/gpui-pre` — `gpui-pre` 0.3.4 plus linear cached-scene replay in `src/scene.rs` and a balanced bounds tree in `src/bounds_tree.rs`
 
 Keep the Cargo package names unchanged. Downstream `[patch.crates-io]` entries rely on them.
 

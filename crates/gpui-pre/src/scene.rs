@@ -85,7 +85,7 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -99,6 +99,10 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.push_primitive(primitive, order);
+    }
+
+    fn push_primitive(&mut self, mut primitive: Primitive, order: DrawOrder) {
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -139,9 +143,59 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        // An enclosing layer assigns one order to every primitive inside it,
+        // so fall back to per-operation replay to keep the cached primitives at
+        // the current layer's order.
+        if self.layer_stack.last().is_some() {
+            for operation in &prev_scene.paint_operations[range] {
+                match operation {
+                    PaintOperation::Primitive(primitive) => {
+                        self.insert_primitive(primitive.clone())
+                    }
+                    PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                    PaintOperation::EndLayer => self.pop_layer(),
+                }
+            }
+            return;
+        }
+
+        // Cached operations already have a stable internal paint order. Reserve
+        // a single order range for the whole fragment and shift the cached
+        // orders into it, instead of re-running a bounds-tree search per
+        // primitive. This keeps replay linear in the number of primitives.
+        let mut union: Option<Bounds<ScaledPixels>> = None;
+        let mut min_order = DrawOrder::MAX;
+        let mut max_order = 0;
+        for operation in &prev_scene.paint_operations[range.clone()] {
+            if let PaintOperation::Primitive(primitive) = operation {
+                let clipped_bounds = primitive
+                    .bounds()
+                    .intersect(&primitive.content_mask().bounds);
+                union = Some(match union {
+                    Some(bounds) => bounds.union(&clipped_bounds),
+                    None => clipped_bounds,
+                });
+                min_order = min_order.min(primitive.order());
+                max_order = max_order.max(primitive.order());
+            }
+        }
+
+        let base = match union {
+            Some(bounds) => self
+                .primitive_bounds
+                .insert_group(bounds, max_order - min_order),
+            None => 0,
+        };
+
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive) => {
+                    let order = base + (primitive.order() - min_order);
+                    self.push_primitive(primitive.clone(), order);
+                }
+                // Route layers through the normal entry points so an enclosing
+                // layer stays on `layer_stack` for later live primitives, even
+                // if the replayed range is not layer-balanced.
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -255,6 +309,19 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+        }
+    }
+
+    pub fn order(&self) -> DrawOrder {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order,
+            Primitive::Quad(quad) => quad.order,
+            Primitive::Path(path) => path.order,
+            Primitive::Underline(underline) => underline.order,
+            Primitive::MonochromeSprite(sprite) => sprite.order,
+            Primitive::SubpixelSprite(sprite) => sprite.order,
+            Primitive::PolychromeSprite(sprite) => sprite.order,
+            Primitive::Surface(surface) => surface.order,
         }
     }
 }
@@ -945,5 +1012,216 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(w),
+                height: ScaledPixels(h),
+            },
+        }
+    }
+
+    fn prim(order: DrawOrder, x: f32, y: f32, w: f32, h: f32) -> Primitive {
+        Primitive::Quad(Quad {
+            order,
+            border_style: BorderStyle::Solid,
+            bounds: at(x, y, w, h),
+            content_mask: ContentMask {
+                bounds: at(0.0, 0.0, 1000.0, 1000.0),
+            },
+            background: Background::default(),
+            border_color: Hsla::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+        })
+    }
+
+    fn underline(order: DrawOrder, x: f32, y: f32, w: f32, h: f32) -> Primitive {
+        Primitive::Underline(Underline {
+            order,
+            pad: 0,
+            bounds: at(x, y, w, h),
+            content_mask: ContentMask {
+                bounds: at(0.0, 0.0, 1000.0, 1000.0),
+            },
+            color: Hsla::default(),
+            thickness: ScaledPixels(1.0),
+            wavy: false.into(),
+        })
+    }
+
+    fn batch_labels(scene: &Scene) -> Vec<String> {
+        scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    #[test]
+    fn replay_preserves_overlap_order_inside_and_across_boundaries() {
+        let fragment = [
+            prim(0, 5.0, 5.0, 50.0, 50.0),
+            prim(0, 10.0, 10.0, 50.0, 50.0),
+            prim(0, 15.0, 15.0, 50.0, 50.0),
+        ];
+
+        let mut expected = Scene::default();
+        expected.insert_primitive(prim(0, 0.0, 0.0, 60.0, 60.0));
+        for primitive in &fragment {
+            expected.insert_primitive(primitive.clone());
+        }
+        expected.insert_primitive(prim(0, 20.0, 20.0, 60.0, 60.0));
+        expected.finish();
+
+        let mut cached = Scene::default();
+        for primitive in &fragment {
+            cached.insert_primitive(primitive.clone());
+        }
+
+        let mut replayed = Scene::default();
+        replayed.insert_primitive(prim(0, 0.0, 0.0, 60.0, 60.0));
+        replayed.replay(0..cached.len(), &cached);
+        replayed.insert_primitive(prim(0, 20.0, 20.0, 60.0, 60.0));
+        replayed.finish();
+
+        let expected_orders: Vec<DrawOrder> =
+            expected.quads.iter().map(|quad| quad.order).collect();
+        let replayed_orders: Vec<DrawOrder> =
+            replayed.quads.iter().map(|quad| quad.order).collect();
+        assert_eq!(expected_orders, replayed_orders);
+        assert!(replayed_orders.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn replay_preserves_cross_kind_batch_order() {
+        // An underline is painted first, then a quad on top. Collapsing the
+        // fragment into one order would let the kind tie-break float the quad
+        // below the underline, changing the batch sequence.
+        let fragment = [
+            underline(0, 0.0, 0.0, 10.0, 10.0),
+            prim(0, 0.0, 0.0, 10.0, 10.0),
+        ];
+
+        let mut expected = Scene::default();
+        for primitive in &fragment {
+            expected.insert_primitive(primitive.clone());
+        }
+        expected.finish();
+
+        let mut cached = Scene::default();
+        for primitive in &fragment {
+            cached.insert_primitive(primitive.clone());
+        }
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..cached.len(), &cached);
+        replayed.finish();
+
+        assert_eq!(batch_labels(&expected), batch_labels(&replayed));
+        assert!(replayed.underlines[0].order < replayed.quads[0].order);
+    }
+
+    #[test]
+    fn replay_preserves_layer_markers_and_relative_order() {
+        let mut cached = Scene::default();
+        cached
+            .paint_operations
+            .push(PaintOperation::Primitive(prim(1, 0.0, 0.0, 10.0, 10.0)));
+        cached
+            .paint_operations
+            .push(PaintOperation::StartLayer(at(0.0, 0.0, 10.0, 10.0)));
+        cached
+            .paint_operations
+            .push(PaintOperation::Primitive(prim(5, 0.0, 0.0, 10.0, 10.0)));
+        cached.paint_operations.push(PaintOperation::EndLayer);
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..cached.len(), &cached);
+
+        assert_eq!(replayed.len(), cached.len());
+        assert!(matches!(
+            replayed.paint_operations[0],
+            PaintOperation::Primitive(_)
+        ));
+        assert!(matches!(
+            replayed.paint_operations[1],
+            PaintOperation::StartLayer(_)
+        ));
+        assert!(matches!(
+            replayed.paint_operations[2],
+            PaintOperation::Primitive(_)
+        ));
+        assert!(matches!(
+            replayed.paint_operations[3],
+            PaintOperation::EndLayer
+        ));
+        assert!(replayed.quads[1].order > replayed.quads[0].order);
+    }
+
+    #[test]
+    fn replay_inside_active_layer_inherits_current_layer_order() {
+        let mut cached = Scene::default();
+        cached.insert_primitive(prim(0, 0.0, 0.0, 5.0, 5.0));
+        cached.insert_primitive(prim(0, 2.0, 2.0, 5.0, 5.0));
+        assert!(cached.quads[0].order < cached.quads[1].order);
+
+        let mut replayed = Scene::default();
+        replayed.push_layer(at(0.0, 0.0, 100.0, 100.0));
+        let layer_order = *replayed.layer_stack.last().unwrap();
+        replayed.replay(0..cached.len(), &cached);
+        replayed.pop_layer();
+
+        // Both cached primitives must inherit the enclosing layer's order,
+        // not their shifted internal orders.
+        assert_eq!(replayed.quads[0].order, layer_order);
+        assert_eq!(replayed.quads[1].order, layer_order);
+        assert!(replayed.layer_stack.is_empty());
+    }
+
+    #[test]
+    fn replay_leaves_enclosing_layer_open_for_later_primitives() {
+        let mut cached = Scene::default();
+        cached
+            .paint_operations
+            .push(PaintOperation::StartLayer(at(0.0, 0.0, 50.0, 50.0)));
+        cached
+            .paint_operations
+            .push(PaintOperation::Primitive(prim(1, 0.0, 0.0, 5.0, 5.0)));
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..cached.len(), &cached);
+        let layer_order = *replayed.layer_stack.last().unwrap();
+
+        // A live primitive after the range must inherit the open layer.
+        replayed.insert_primitive(prim(0, 1.0, 1.0, 5.0, 5.0));
+        assert_eq!(replayed.quads[1].order, layer_order);
+
+        replayed.pop_layer();
+        assert!(replayed.layer_stack.is_empty());
+    }
+
+    #[test]
+    fn replay_registers_clipped_fragment_extent() {
+        let mut cached = Scene::default();
+        let Primitive::Quad(mut fragment) = prim(3, 0.0, 0.0, 100.0, 100.0) else {
+            unreachable!()
+        };
+        fragment.content_mask = ContentMask {
+            bounds: at(0.0, 0.0, 10.0, 10.0),
+        };
+        cached.insert_primitive(Primitive::Quad(fragment));
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..cached.len(), &cached);
+
+        // Overlaps the raw bounds but not the clipped extent, so it keeps the
+        // fragment's order instead of being forced above it.
+        replayed.insert_primitive(prim(0, 50.0, 50.0, 5.0, 5.0));
+        assert_eq!(replayed.quads[0].order, replayed.quads[1].order);
     }
 }
