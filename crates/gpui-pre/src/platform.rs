@@ -1440,6 +1440,7 @@ impl From<TileId> for etagere::AllocId {
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
     handler: Box<dyn InputHandler>,
+    transform: crate::TransformationMatrix,
 }
 
 #[expect(missing_docs)]
@@ -1452,7 +1453,16 @@ pub struct PlatformInputHandler {
 )]
 impl PlatformInputHandler {
     pub fn new(cx: AsyncWindowContext, handler: Box<dyn InputHandler>) -> Self {
-        Self { cx, handler }
+        Self {
+            cx,
+            handler,
+            transform: crate::TransformationMatrix::unit(),
+        }
+    }
+
+    pub(crate) fn with_transform(mut self, transform: crate::TransformationMatrix) -> Self {
+        self.transform = transform;
+        self
     }
 
     pub fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
@@ -1537,6 +1547,7 @@ impl PlatformInputHandler {
             .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
             .ok()
             .flatten()
+            .map(|bounds| self.transform.transform_bounds(bounds))
     }
 
     #[allow(dead_code)]
@@ -1589,18 +1600,19 @@ impl PlatformInputHandler {
         Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
             self.handler.bounds_for_range(range, window, cx)
         })
+        .map(|bounds| self.transform.transform_bounds(bounds))
     }
 
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
-        let marked_range = self.marked_text_range();
-        let selection = self.selected_text_range(true)?;
-        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
-            self.bounds_for_range(range)
-        })
+        let mut cx = self.cx.clone();
+        cx.update(|window, cx| self.selected_bounds(window, cx))
+            .ok()
+            .flatten()
     }
 
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
+        let point = self.transform.inverse()?.apply(point);
         self.cx
             .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
             .ok()
@@ -1623,6 +1635,7 @@ impl PlatformInputHandler {
             .update(|window, cx| self.handler.element_bounds(window, cx))
             .ok()
             .flatten()
+            .map(|bounds| self.transform.transform_bounds(bounds))
     }
 
     /// See [`InputHandler::text_length_utf16`].

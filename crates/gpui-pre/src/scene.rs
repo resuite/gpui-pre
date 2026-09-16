@@ -40,6 +40,12 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    /// Spatial state applied to newly inserted primitives. Zero is the identity fast path.
+    pub(crate) spatial_id: SpatialId,
+    /// Sparse affine state. IDs are one-based so `SpatialId(0)` needs no GPU lookup.
+    pub spatial_states: Vec<SpatialState>,
+    /// Ancestor clip rectangles referenced by transformed spatial states.
+    pub transform_clips: Vec<TransformedClip>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
@@ -56,6 +62,9 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.spatial_id = SpatialId::IDENTITY;
+        self.spatial_states.clear();
+        self.transform_clips.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
@@ -85,10 +94,14 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let primitive = primitive.into();
-        let clipped_bounds = primitive
-            .bounds()
-            .intersect(&primitive.content_mask().bounds);
+        let mut primitive = primitive.into();
+        *primitive.spatial_id_mut() = self.spatial_id;
+        let matrix = self.spatial_matrix(self.spatial_id);
+        self.insert_spatial_primitive(primitive, matrix);
+    }
+
+    fn insert_spatial_primitive(&mut self, primitive: Primitive, matrix: TransformationMatrix) {
+        let clipped_bounds = primitive.clipped_bounds(matrix);
 
         if clipped_bounds.is_empty() {
             return;
@@ -143,6 +156,9 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        let mut spatial_map = vec![None; prev_scene.spatial_states.len() + 1];
+        spatial_map[0] = Some(SpatialId::IDENTITY);
+
         // An enclosing layer assigns one order to every primitive inside it,
         // so fall back to per-operation replay to keep the cached primitives at
         // the current layer's order.
@@ -150,7 +166,10 @@ impl Scene {
             for operation in &prev_scene.paint_operations[range] {
                 match operation {
                     PaintOperation::Primitive(primitive) => {
-                        self.insert_primitive(primitive.clone())
+                        let primitive =
+                            self.replay_primitive(primitive, prev_scene, &mut spatial_map);
+                        let matrix = self.spatial_matrix(primitive.spatial_id());
+                        self.insert_spatial_primitive(primitive, matrix)
                     }
                     PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                     PaintOperation::EndLayer => self.pop_layer(),
@@ -168,9 +187,8 @@ impl Scene {
         let mut max_order = 0;
         for operation in &prev_scene.paint_operations[range.clone()] {
             if let PaintOperation::Primitive(primitive) = operation {
-                let clipped_bounds = primitive
-                    .bounds()
-                    .intersect(&primitive.content_mask().bounds);
+                let clipped_bounds =
+                    primitive.clipped_bounds(prev_scene.spatial_matrix(primitive.spatial_id()));
                 union = Some(match union {
                     Some(bounds) => bounds.union(&clipped_bounds),
                     None => clipped_bounds,
@@ -191,7 +209,8 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => {
                     let order = base + (primitive.order() - min_order);
-                    self.push_primitive(primitive.clone(), order);
+                    let primitive = self.replay_primitive(primitive, prev_scene, &mut spatial_map);
+                    self.push_primitive(primitive, order);
                 }
                 // Route layers through the normal entry points so an enclosing
                 // layer stays on `layer_stack` for later live primitives, even
@@ -200,6 +219,56 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
+    }
+
+    fn replay_primitive(
+        &mut self,
+        primitive: &Primitive,
+        previous: &Scene,
+        spatial_map: &mut [Option<SpatialId>],
+    ) -> Primitive {
+        let mut primitive = primitive.clone();
+        let old_id = primitive.spatial_id();
+        if old_id != SpatialId::IDENTITY {
+            let index = old_id.index().expect("non-identity spatial id");
+            let new_id = match spatial_map[index + 1] {
+                Some(id) => id,
+                None => {
+                    let mut state = previous.spatial_states[index];
+                    if state.clip_count != 0 {
+                        let start = state.clip_start as usize;
+                        let clips =
+                            &previous.transform_clips[start..start + state.clip_count as usize];
+                        state.clip_start = self.transform_clips.len() as u32;
+                        self.transform_clips.extend_from_slice(clips);
+                    }
+                    let id = self.push_spatial_state(state);
+                    spatial_map[index + 1] = Some(id);
+                    id
+                }
+            };
+            *primitive.spatial_id_mut() = new_id;
+        }
+        primitive
+    }
+
+    /// Register sparse paint state and return its one-based identifier.
+    pub(crate) fn push_spatial_state(&mut self, state: SpatialState) -> SpatialId {
+        self.spatial_states.push(state);
+        SpatialId(self.spatial_states.len() as u32)
+    }
+
+    /// Resolve a compact spatial identifier to its affine state.
+    #[inline]
+    pub fn spatial_state(&self, id: SpatialId) -> Option<&SpatialState> {
+        id.index().map(|index| &self.spatial_states[index])
+    }
+
+    /// Resolve the affine matrix for a spatial identifier. Identity needs no table entry.
+    #[inline]
+    pub fn spatial_matrix(&self, id: SpatialId) -> TransformationMatrix {
+        self.spatial_state(id)
+            .map_or_else(TransformationMatrix::unit, |state| state.matrix)
     }
 
     pub fn finish(&mut self) {
@@ -286,6 +355,45 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    fn spatial_id_mut(&mut self) -> &mut SpatialId {
+        match self {
+            Self::Shadow(value) => &mut value.spatial_id,
+            Self::Quad(value) => &mut value.spatial_id,
+            Self::Path(value) => &mut value.spatial_id,
+            Self::Underline(value) => &mut value.spatial_id,
+            Self::MonochromeSprite(value) => &mut value.spatial_id,
+            Self::SubpixelSprite(value) => &mut value.spatial_id,
+            Self::PolychromeSprite(value) => &mut value.spatial_id,
+            Self::Surface(value) => &mut value.spatial_id,
+        }
+    }
+
+    fn spatial_id(&self) -> SpatialId {
+        match self {
+            Self::Shadow(value) => value.spatial_id,
+            Self::Quad(value) => value.spatial_id,
+            Self::Path(value) => value.spatial_id,
+            Self::Underline(value) => value.spatial_id,
+            Self::MonochromeSprite(value) => value.spatial_id,
+            Self::SubpixelSprite(value) => value.spatial_id,
+            Self::PolychromeSprite(value) => value.spatial_id,
+            Self::Surface(value) => value.spatial_id,
+        }
+    }
+
+    fn clipped_bounds(&self, matrix: TransformationMatrix) -> Bounds<ScaledPixels> {
+        let bounds = match self {
+            Self::MonochromeSprite(value) => {
+                value.transformation.transform_scaled_bounds(value.bounds)
+            }
+            Self::SubpixelSprite(value) => {
+                value.transformation.transform_scaled_bounds(value.bounds)
+            }
+            _ => *self.bounds(),
+        };
+        matrix.transform_scaled_bounds(bounds.intersect(&self.content_mask().bounds))
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -398,10 +506,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
+                let transformed = !self.shadows_iter.peek().unwrap().spatial_id.is_identity();
                 self.shadows_iter.next();
                 while self
                     .shadows_iter
-                    .next_if(|shadow| (shadow.order, batch_kind) < max_order_and_kind)
+                    .next_if(|shadow| {
+                        (shadow.order, batch_kind) < max_order_and_kind
+                            && (!shadow.spatial_id.is_identity()) == transformed
+                    })
                     .is_some()
                 {
                     shadows_end += 1;
@@ -412,10 +524,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Quad => {
                 let quads_start = self.quads_start;
                 let mut quads_end = quads_start + 1;
+                let transformed = !self.quads_iter.peek().unwrap().spatial_id.is_identity();
                 self.quads_iter.next();
                 while self
                     .quads_iter
-                    .next_if(|quad| (quad.order, batch_kind) < max_order_and_kind)
+                    .next_if(|quad| {
+                        (quad.order, batch_kind) < max_order_and_kind
+                            && (!quad.spatial_id.is_identity()) == transformed
+                    })
                     .is_some()
                 {
                     quads_end += 1;
@@ -426,10 +542,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
                 let mut paths_end = paths_start + 1;
+                let transformed = !self.paths_iter.peek().unwrap().spatial_id.is_identity();
                 self.paths_iter.next();
                 while self
                     .paths_iter
-                    .next_if(|path| (path.order, batch_kind) < max_order_and_kind)
+                    .next_if(|path| {
+                        (path.order, batch_kind) < max_order_and_kind
+                            && (!path.spatial_id.is_identity()) == transformed
+                    })
                     .is_some()
                 {
                     paths_end += 1;
@@ -440,10 +560,19 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Underline => {
                 let underlines_start = self.underlines_start;
                 let mut underlines_end = underlines_start + 1;
+                let transformed = !self
+                    .underlines_iter
+                    .peek()
+                    .unwrap()
+                    .spatial_id
+                    .is_identity();
                 self.underlines_iter.next();
                 while self
                     .underlines_iter
-                    .next_if(|underline| (underline.order, batch_kind) < max_order_and_kind)
+                    .next_if(|underline| {
+                        (underline.order, batch_kind) < max_order_and_kind
+                            && (!underline.spatial_id.is_identity()) == transformed
+                    })
                     .is_some()
                 {
                     underlines_end += 1;
@@ -453,6 +582,12 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
+                let transformed = !self
+                    .monochrome_sprites_iter
+                    .peek()
+                    .unwrap()
+                    .spatial_id
+                    .is_identity();
                 let sprites_start = self.monochrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.monochrome_sprites_iter.next();
@@ -461,6 +596,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
+                            && (!sprite.spatial_id.is_identity()) == transformed
                     })
                     .is_some()
                 {
@@ -474,6 +610,12 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
             PrimitiveKind::SubpixelSprite => {
                 let texture_id = self.subpixel_sprites_iter.peek().unwrap().tile.texture_id;
+                let transformed = !self
+                    .subpixel_sprites_iter
+                    .peek()
+                    .unwrap()
+                    .spatial_id
+                    .is_identity();
                 let sprites_start = self.subpixel_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.subpixel_sprites_iter.next();
@@ -482,6 +624,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
+                            && (!sprite.spatial_id.is_identity()) == transformed
                     })
                     .is_some()
                 {
@@ -495,6 +638,12 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
+                let transformed = !self
+                    .polychrome_sprites_iter
+                    .peek()
+                    .unwrap()
+                    .spatial_id
+                    .is_identity();
                 let sprites_start = self.polychrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.polychrome_sprites_iter.next();
@@ -503,6 +652,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
                             && sprite.tile.texture_id == texture_id
+                            && (!sprite.spatial_id.is_identity()) == transformed
                     })
                     .is_some()
                 {
@@ -517,10 +667,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
+                let transformed = !self.surfaces_iter.peek().unwrap().spatial_id.is_identity();
                 self.surfaces_iter.next();
                 while self
                     .surfaces_iter
-                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .next_if(|surface| {
+                        (surface.order, batch_kind) < max_order_and_kind
+                            && (!surface.spatial_id.is_identity()) == transformed
+                    })
                     .is_some()
                 {
                     surfaces_end += 1;
@@ -608,6 +762,7 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub spatial_id: SpatialId,
 }
 
 impl From<Quad> for Primitive {
@@ -627,6 +782,7 @@ pub struct Underline {
     pub color: Hsla,
     pub thickness: ScaledPixels,
     pub wavy: PaddedBool32,
+    pub spatial_id: SpatialId,
 }
 
 impl From<Underline> for Primitive {
@@ -650,12 +806,56 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+    pub spatial_id: SpatialId,
 }
 
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
     }
+}
+
+/// Compact reference to sparse affine paint state. Zero is always identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SpatialId(pub u32);
+
+impl SpatialId {
+    /// The untransformed root state. Primitives with this ID use the ordinary renderer path.
+    pub const IDENTITY: Self = Self(0);
+
+    /// Whether this ID denotes the untransformed root state.
+    #[inline]
+    pub fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
+
+    #[inline]
+    fn index(self) -> Option<usize> {
+        self.0.checked_sub(1).map(|value| value as usize)
+    }
+}
+
+/// Affine paint state shared by every primitive under one transformed subtree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct SpatialState {
+    /// Maps layout coordinates to window coordinates, in device pixels.
+    pub matrix: TransformationMatrix,
+    /// First cross-space ancestor clip in `Scene::transform_clips`.
+    pub clip_start: u32,
+    /// Number of cross-space ancestor clips.
+    pub clip_count: u32,
+}
+
+/// A clip rectangle and the inverse transform into its coordinate space.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct TransformedClip {
+    /// Maps window coordinates into the clip's coordinates.
+    pub inverse: TransformationMatrix,
+    /// Rectangle before transformation.
+    pub bounds: Bounds<ScaledPixels>,
 }
 
 /// The style of a border.
@@ -753,7 +953,69 @@ impl TransformationMatrix {
         }
     }
 
-    /// Apply transformation to a point, mainly useful for debugging
+    /// Change the units of the translation while preserving the linear part.
+    pub fn scaled(mut self, factor: f32) -> Self {
+        self.translation[0] *= factor;
+        self.translation[1] *= factor;
+        self
+    }
+
+    /// Invert a finite, nonsingular affine transform.
+    pub fn inverse(self) -> Option<Self> {
+        let [[a, c], [b, d]] = self.rotation_scale;
+        let determinant = a * d - b * c;
+        if determinant == 0.0 || !determinant.is_finite() {
+            return None;
+        }
+        let inverse = Self {
+            rotation_scale: [
+                [d / determinant, -c / determinant],
+                [-b / determinant, a / determinant],
+            ],
+            translation: [0.0, 0.0],
+        };
+        let offset = inverse.apply(point(
+            Pixels(-self.translation[0]),
+            Pixels(-self.translation[1]),
+        ));
+        let result = Self {
+            translation: [offset.x.0, offset.y.0],
+            ..inverse
+        };
+        result
+            .rotation_scale
+            .iter()
+            .flatten()
+            .chain(result.translation.iter())
+            .all(|v| v.is_finite())
+            .then_some(result)
+    }
+
+    /// The axis-aligned bounds enclosing all four transformed corners.
+    pub fn transform_bounds(self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        let corners = [
+            bounds.origin,
+            bounds.top_right(),
+            bounds.bottom_left(),
+            bounds.bottom_right(),
+        ];
+        let first = self.apply(corners[0]);
+        let (mut min, mut max) = (first, first);
+        for corner in &corners[1..] {
+            let point = self.apply(*corner);
+            min = min.min(&point);
+            max = max.max(&point);
+        }
+        Bounds::from_corners(min, max)
+    }
+
+    /// The device-pixel counterpart of `transform_bounds`.
+    pub fn transform_scaled_bounds(self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        self.transform_bounds(bounds.map(|value| Pixels(value.0)))
+            .map(|value| ScaledPixels(value.0))
+    }
+
+    /// Apply transformation to a point.
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
         let mut output = self.translation;
@@ -783,6 +1045,7 @@ pub struct MonochromeSprite {
     pub color: Hsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    pub spatial_id: SpatialId,
 }
 
 impl From<MonochromeSprite> for Primitive {
@@ -802,6 +1065,7 @@ pub struct SubpixelSprite {
     pub color: Hsla,
     pub tile: AtlasTile,
     pub transformation: TransformationMatrix,
+    pub spatial_id: SpatialId,
 }
 
 impl From<SubpixelSprite> for Primitive {
@@ -822,6 +1086,7 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    pub spatial_id: SpatialId,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -838,6 +1103,7 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub spatial_id: SpatialId,
 }
 
 impl From<PaintSurface> for Primitive {
@@ -859,6 +1125,7 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub bounds: Bounds<P>,
     pub content_mask: ContentMask<P>,
     pub vertices: Vec<PathVertex<P>>,
+    pub spatial_id: SpatialId,
     pub color: Background,
     start: Point<P>,
     current: Point<P>,
@@ -870,6 +1137,7 @@ impl Path<Pixels> {
     pub fn new(start: Point<Pixels>) -> Self {
         Self {
             id: PathId(0),
+            spatial_id: SpatialId::IDENTITY,
             order: DrawOrder::default(),
             vertices: Vec::new(),
             start,
@@ -888,6 +1156,7 @@ impl Path<Pixels> {
     pub fn scale(&self, factor: f32) -> Path<ScaledPixels> {
         Path {
             id: self.id,
+            spatial_id: self.spatial_id,
             order: self.order,
             bounds: self.bounds.scale(factor),
             content_mask: self.content_mask.scale(factor),
@@ -989,6 +1258,13 @@ where
     }
 }
 
+impl Path<ScaledPixels> {
+    /// Window-space bounds used when copying rasterized paths.
+    pub fn transformed_bounds(&self, matrix: TransformationMatrix) -> Bounds<ScaledPixels> {
+        matrix.transform_scaled_bounds(self.clipped_bounds())
+    }
+}
+
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)
@@ -1031,6 +1307,7 @@ mod tests {
 
     fn prim(order: DrawOrder, x: f32, y: f32, w: f32, h: f32) -> Primitive {
         Primitive::Quad(Quad {
+            spatial_id: SpatialId::IDENTITY,
             order,
             border_style: BorderStyle::Solid,
             bounds: at(x, y, w, h),
@@ -1046,6 +1323,7 @@ mod tests {
 
     fn underline(order: DrawOrder, x: f32, y: f32, w: f32, h: f32) -> Primitive {
         Primitive::Underline(Underline {
+            spatial_id: SpatialId::IDENTITY,
             order,
             pad: 0,
             bounds: at(x, y, w, h),
@@ -1060,6 +1338,59 @@ mod tests {
 
     fn batch_labels(scene: &Scene) -> Vec<String> {
         scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    #[test]
+    fn affine_inverse_and_bounds_include_all_corners() {
+        let matrix = TransformationMatrix::unit()
+            .translate(point(ScaledPixels(30.0), ScaledPixels(20.0)))
+            .rotate(Radians(std::f32::consts::FRAC_PI_2))
+            .scale(crate::size(-2.0, 3.0));
+        let point = point(Pixels(4.0), Pixels(5.0));
+        let roundtrip = matrix.inverse().unwrap().apply(matrix.apply(point));
+        assert!((roundtrip.x - point.x).abs() < Pixels(0.001));
+        assert!((roundtrip.y - point.y).abs() < Pixels(0.001));
+        let bounds = matrix.transform_scaled_bounds(at(0.0, 0.0, 10.0, 5.0));
+        assert!((bounds.size.width.0 - 15.0).abs() < 0.001);
+        assert!((bounds.size.height.0 - 20.0).abs() < 0.001);
+        assert!(
+            TransformationMatrix::unit()
+                .scale(crate::size(0.0, 1.0))
+                .inverse()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn transformed_scene_order_and_replay_keep_clip_references() {
+        let mut previous = Scene::default();
+        let clip = TransformedClip {
+            inverse: TransformationMatrix::unit(),
+            bounds: at(0.0, 0.0, 500.0, 500.0),
+        };
+        previous.transform_clips.push(clip);
+        previous.spatial_id = previous.push_spatial_state(SpatialState {
+            matrix: TransformationMatrix::unit()
+                .translate(point(ScaledPixels(100.0), ScaledPixels(0.0))),
+            clip_start: 0,
+            clip_count: 1,
+        });
+        previous.insert_primitive(prim(0, 0.0, 0.0, 40.0, 40.0));
+        previous.spatial_id = SpatialId::IDENTITY;
+        previous.insert_primitive(prim(0, 110.0, 10.0, 20.0, 20.0));
+        assert!(previous.quads[1].order > previous.quads[0].order);
+
+        let mut replayed = Scene::default();
+        replayed.transform_clips.push(TransformedClip::default());
+        replayed.replay(0..previous.len(), &previous);
+        let state = replayed.spatial_states[replayed.quads[0].spatial_id.index().unwrap()];
+        assert_eq!(
+            state.matrix,
+            previous.spatial_states[previous.quads[0].spatial_id.index().unwrap()].matrix
+        );
+        assert_eq!(state.clip_start, 1);
+        assert_eq!(replayed.transform_clips[state.clip_start as usize], clip);
+        assert!(replayed.quads[1].order > replayed.quads[0].order);
     }
 
     #[test]

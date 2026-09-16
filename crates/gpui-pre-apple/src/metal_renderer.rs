@@ -8,7 +8,7 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, ScaledPixels, Scene, Size, SpatialId, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -119,13 +119,20 @@ pub struct MetalRenderer {
     opaque: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
+    paths_rasterization_transformed_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
+    shadows_transformed_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    quads_transformed_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
+    underlines_transformed_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
+    monochrome_sprites_transformed_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
+    polychrome_sprites_transformed_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    surfaces_transformed_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -140,6 +147,149 @@ pub struct MetalRenderer {
     headless_render_target: Option<metal::Texture>,
 }
 
+/// GPU records replace CPU-only draw order with the spatial id, preserving
+/// the pre-transform instance stride for the ordinary rendering path.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct GpuQuad {
+    pub spatial_id: SpatialId,
+    pub border_style: gpui::BorderStyle,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub background: Background,
+    pub border_color: gpui::Hsla,
+    pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub border_widths: gpui::Edges<ScaledPixels>,
+}
+
+impl From<&gpui::Quad> for GpuQuad {
+    fn from(value: &gpui::Quad) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            border_style: value.border_style,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            background: value.background,
+            border_color: value.border_color,
+            corner_radii: value.corner_radii,
+            border_widths: value.border_widths,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct GpuShadow {
+    pub spatial_id: SpatialId,
+    pub blur_radius: ScaledPixels,
+    pub bounds: Bounds<ScaledPixels>,
+    pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: gpui::Hsla,
+    pub element_bounds: Bounds<ScaledPixels>,
+    pub element_corner_radii: gpui::Corners<ScaledPixels>,
+    pub inset: u32,
+    pub pad: u32,
+}
+
+impl From<&gpui::Shadow> for GpuShadow {
+    fn from(value: &gpui::Shadow) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            blur_radius: value.blur_radius,
+            bounds: value.bounds,
+            corner_radii: value.corner_radii,
+            content_mask: value.content_mask,
+            color: value.color,
+            element_bounds: value.element_bounds,
+            element_corner_radii: value.element_corner_radii,
+            inset: value.inset,
+            pad: value.pad,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct GpuUnderline {
+    pub spatial_id: SpatialId,
+    pub pad: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: gpui::Hsla,
+    pub thickness: ScaledPixels,
+    pub wavy: gpui::PaddedBool32,
+}
+
+impl From<&gpui::Underline> for GpuUnderline {
+    fn from(value: &gpui::Underline) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            color: value.color,
+            thickness: value.thickness,
+            wavy: value.wavy,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct GpuMonochromeSprite {
+    pub spatial_id: SpatialId,
+    pub pad: u32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub color: gpui::Hsla,
+    pub tile: gpui::AtlasTile,
+    pub transformation: gpui::TransformationMatrix,
+}
+
+impl From<&gpui::MonochromeSprite> for GpuMonochromeSprite {
+    fn from(value: &gpui::MonochromeSprite) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            color: value.color,
+            tile: value.tile,
+            transformation: value.transformation,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct GpuPolychromeSprite {
+    pub spatial_id: SpatialId,
+    pub pad: u32,
+    pub grayscale: gpui::PaddedBool32,
+    pub opacity: f32,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub tile: gpui::AtlasTile,
+}
+
+impl From<&gpui::PolychromeSprite> for GpuPolychromeSprite {
+    fn from(value: &gpui::PolychromeSprite) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            grayscale: value.grayscale,
+            opacity: value.opacity,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            corner_radii: value.corner_radii,
+            tile: value.tile,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct PathRasterizationVertex {
     pub xy_position: Point<ScaledPixels>,
@@ -147,6 +297,23 @@ pub struct PathRasterizationVertex {
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TransformedPathRasterizationVertex {
+    pub path_vertex: PathRasterizationVertex,
+    pub spatial_id: SpatialId,
+    pub pad: u32,
+}
+
+// Shader ABI: ordinary records retain upstream GPUI's original stride.
+const _: [(); 160] = [(); mem::size_of::<GpuQuad>()];
+const _: [(); 112] = [(); mem::size_of::<GpuShadow>()];
+const _: [(); 104] = [(); mem::size_of::<PathRasterizationVertex>()];
+const _: [(); 112] = [(); mem::size_of::<TransformedPathRasterizationVertex>()];
+const _: [(); 64] = [(); mem::size_of::<GpuUnderline>()];
+const _: [(); 112] = [(); mem::size_of::<GpuMonochromeSprite>()];
+const _: [(); 96] = [(); mem::size_of::<GpuPolychromeSprite>()];
 
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
@@ -267,6 +434,16 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
             PATH_SAMPLE_COUNT,
         );
+        let paths_rasterization_transformed_pipeline_state =
+            build_path_rasterization_pipeline_state(
+                &device,
+                &library,
+                "paths_rasterization_transformed",
+                "path_rasterization_vertex_transformed",
+                "path_rasterization_fragment_transformed",
+                MTLPixelFormat::BGRA8Unorm,
+                PATH_SAMPLE_COUNT,
+            );
         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &library,
@@ -283,12 +460,28 @@ impl MetalRenderer {
             "shadow_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let shadows_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "shadows_transformed",
+            "shadow_vertex_transformed",
+            "shadow_fragment_transformed",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let quads_pipeline_state = build_pipeline_state(
             &device,
             &library,
             "quads",
             "quad_vertex",
             "quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let quads_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "quads_transformed",
+            "quad_vertex_transformed",
+            "quad_fragment_transformed",
             MTLPixelFormat::BGRA8Unorm,
         );
         let underlines_pipeline_state = build_pipeline_state(
@@ -299,12 +492,28 @@ impl MetalRenderer {
             "underline_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let underlines_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "underlines_transformed",
+            "underline_vertex_transformed",
+            "underline_fragment_transformed",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let monochrome_sprites_pipeline_state = build_pipeline_state(
             &device,
             &library,
             "monochrome_sprites",
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let monochrome_sprites_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "monochrome_sprites_transformed",
+            "monochrome_sprite_vertex_transformed",
+            "monochrome_sprite_fragment_transformed",
             MTLPixelFormat::BGRA8Unorm,
         );
         let polychrome_sprites_pipeline_state = build_pipeline_state(
@@ -315,12 +524,28 @@ impl MetalRenderer {
             "polychrome_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let polychrome_sprites_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "polychrome_sprites_transformed",
+            "polychrome_sprite_vertex_transformed",
+            "polychrome_sprite_fragment_transformed",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let surfaces_pipeline_state = build_pipeline_state(
             &device,
             &library,
             "surfaces",
             "surface_vertex",
             "surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let surfaces_transformed_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_transformed",
+            "surface_vertex_transformed",
+            "surface_fragment_transformed",
             MTLPixelFormat::BGRA8Unorm,
         );
 
@@ -338,13 +563,20 @@ impl MetalRenderer {
             opaque,
             command_queue,
             paths_rasterization_pipeline_state,
+            paths_rasterization_transformed_pipeline_state,
             path_sprites_pipeline_state,
             shadows_pipeline_state,
+            shadows_transformed_pipeline_state,
             quads_pipeline_state,
+            quads_transformed_pipeline_state,
             underlines_pipeline_state,
+            underlines_transformed_pipeline_state,
             monochrome_sprites_pipeline_state,
+            monochrome_sprites_transformed_pipeline_state,
             polychrome_sprites_pipeline_state,
+            polychrome_sprites_transformed_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_transformed_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -667,14 +899,64 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        let spatial = if scene.spatial_states.is_empty() {
+            None
+        } else {
+            let states = writer.write(&scene.spatial_states)?;
+            let fallback_clip = [gpui::TransformedClip::default()];
+            let clips = writer.write(if scene.transform_clips.is_empty() {
+                &fallback_clip
+            } else {
+                &scene.transform_clips
+            })?;
+            Some((states, clips))
+        };
         for batch in scene.batches() {
-            match batch {
+            let transformed = match &batch {
                 PrimitiveBatch::Shadows(range) => {
-                    self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
+                    !scene.shadows[range.start].spatial_id.is_identity()
                 }
-                PrimitiveBatch::Quads(range) => {
-                    self.draw_quads(range, instance_bindings, viewport_size, command_encoder)
+                PrimitiveBatch::Quads(range) => !scene.quads[range.start].spatial_id.is_identity(),
+                PrimitiveBatch::Paths(range) => !scene.paths[range.start].spatial_id.is_identity(),
+                PrimitiveBatch::Underlines(range) => {
+                    !scene.underlines[range.start].spatial_id.is_identity()
                 }
+                PrimitiveBatch::MonochromeSprites { range, .. } => !scene.monochrome_sprites
+                    [range.start]
+                    .spatial_id
+                    .is_identity(),
+                PrimitiveBatch::PolychromeSprites { range, .. } => !scene.polychrome_sprites
+                    [range.start]
+                    .spatial_id
+                    .is_identity(),
+                PrimitiveBatch::Surfaces(range) => {
+                    !scene.surfaces[range.start].spatial_id.is_identity()
+                }
+                PrimitiveBatch::SubpixelSprites { .. } => false,
+            };
+            if transformed {
+                bind_spatial_buffers(
+                    command_encoder,
+                    spatial
+                        .as_ref()
+                        .expect("transformed batch requires spatial data"),
+                );
+            }
+            match batch {
+                PrimitiveBatch::Shadows(range) => self.draw_shadows(
+                    range,
+                    transformed,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Quads(range) => self.draw_quads(
+                    range,
+                    transformed,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
@@ -684,6 +966,7 @@ impl MetalRenderer {
                         writer,
                         viewport_size,
                         command_buffer,
+                        spatial.as_ref(),
                     )?;
 
                     command_encoder = new_command_encoder_for_texture(
@@ -695,6 +978,7 @@ impl MetalRenderer {
 
                     if did_draw {
                         if let Err(error) = self.draw_paths_from_intermediate(
+                            scene,
                             paths,
                             writer,
                             viewport_size,
@@ -705,13 +989,18 @@ impl MetalRenderer {
                         }
                     }
                 }
-                PrimitiveBatch::Underlines(range) => {
-                    self.draw_underlines(range, instance_bindings, viewport_size, command_encoder)
-                }
+                PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                    range,
+                    transformed,
+                    instance_bindings,
+                    viewport_size,
+                    command_encoder,
+                ),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => self
                     .draw_monochrome_sprites(
                         texture_id,
                         range,
+                        transformed,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
@@ -720,6 +1009,7 @@ impl MetalRenderer {
                     .draw_polychrome_sprites(
                         texture_id,
                         range,
+                        transformed,
                         instance_bindings,
                         viewport_size,
                         command_encoder,
@@ -727,6 +1017,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range.clone()],
                     range.start,
+                    transformed,
                     instance_bindings,
                     viewport_size,
                     command_encoder,
@@ -746,6 +1037,7 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
+        spatial: Option<&(InstanceBinding, InstanceBinding)>,
     ) -> Result<bool> {
         if paths.is_empty() {
             return Ok(false);
@@ -755,16 +1047,41 @@ impl MetalRenderer {
             .as_ref()
             .context("missing path intermediate texture")?;
 
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-            }));
-        }
-        let vertex_instance_bindings = writer.write(&vertices)?;
+        let transformed = !paths[0].spatial_id.is_identity();
+        let vertex_instance_bindings = if transformed {
+            let count: usize = paths.iter().map(|path| path.vertices.len()).sum();
+            writer.write_iter_count(
+                paths.iter().flat_map(|path| {
+                    path.vertices
+                        .iter()
+                        .map(move |v| TransformedPathRasterizationVertex {
+                            path_vertex: PathRasterizationVertex {
+                                xy_position: v.xy_position,
+                                st_position: v.st_position,
+                                color: path.color,
+                                bounds: path.bounds.intersect(&path.content_mask.bounds),
+                            },
+                            spatial_id: path.spatial_id,
+                            pad: 0,
+                        })
+                }),
+                count,
+            )?
+        } else {
+            let count: usize = paths.iter().map(|path| path.vertices.len()).sum();
+            writer.write_iter_count(
+                paths.iter().flat_map(|path| {
+                    path.vertices.iter().map(move |v| PathRasterizationVertex {
+                        xy_position: v.xy_position,
+                        st_position: v.st_position,
+                        color: path.color,
+                        bounds: path.bounds.intersect(&path.content_mask.bounds),
+                    })
+                }),
+                count,
+            )?
+        };
+        let vertex_count: usize = paths.iter().map(|path| path.vertices.len()).sum();
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -784,7 +1101,17 @@ impl MetalRenderer {
         }
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
-        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        if transformed {
+            bind_spatial_buffers(
+                command_encoder,
+                spatial.expect("transformed path batch requires spatial data"),
+            );
+        }
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.paths_rasterization_transformed_pipeline_state
+        } else {
+            &self.paths_rasterization_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             PathRasterizationInputIndex::Vertices as u64,
             Some(&vertex_instance_bindings.buffer),
@@ -800,11 +1127,7 @@ impl MetalRenderer {
             Some(&vertex_instance_bindings.buffer),
             vertex_instance_bindings.offset as u64,
         );
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            vertices.len() as u64,
-        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, vertex_count as u64);
 
         command_encoder.end_encoding();
         Ok(true)
@@ -813,6 +1136,7 @@ impl MetalRenderer {
     fn draw_shadows(
         &self,
         shadows: Range<usize>,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -821,7 +1145,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.shadows_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.shadows_transformed_pipeline_state
+        } else {
+            &self.shadows_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             ShadowInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -855,6 +1183,7 @@ impl MetalRenderer {
     fn draw_quads(
         &self,
         quads: Range<usize>,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -863,7 +1192,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.quads_transformed_pipeline_state
+        } else {
+            &self.quads_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -896,6 +1229,7 @@ impl MetalRenderer {
 
     fn draw_paths_from_intermediate(
         &self,
+        scene: &Scene,
         paths: &[Path<ScaledPixels>],
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
@@ -938,13 +1272,15 @@ impl MetalRenderer {
             sprites = paths
                 .iter()
                 .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
+                    bounds: path.transformed_bounds(scene.spatial_matrix(path.spatial_id)),
                 })
                 .collect();
         } else {
-            let mut bounds = first_path.clipped_bounds();
+            let mut bounds =
+                first_path.transformed_bounds(scene.spatial_matrix(first_path.spatial_id));
             for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
+                bounds =
+                    bounds.union(&path.transformed_bounds(scene.spatial_matrix(path.spatial_id)));
             }
             sprites = vec![PathSprite { bounds }];
         }
@@ -968,6 +1304,7 @@ impl MetalRenderer {
     fn draw_underlines(
         &self,
         underlines: Range<usize>,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -976,7 +1313,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.underlines_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.underlines_transformed_pipeline_state
+        } else {
+            &self.underlines_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             UnderlineInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1011,6 +1352,7 @@ impl MetalRenderer {
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -1024,7 +1366,11 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.monochrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.monochrome_sprites_transformed_pipeline_state
+        } else {
+            &self.monochrome_sprites_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1065,6 +1411,7 @@ impl MetalRenderer {
         &self,
         texture_id: AtlasTextureId,
         sprites: Range<usize>,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -1078,7 +1425,11 @@ impl MetalRenderer {
             DevicePixels(texture.width() as i32),
             DevicePixels(texture.height() as i32),
         );
-        command_encoder.set_render_pipeline_state(&self.polychrome_sprites_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.polychrome_sprites_transformed_pipeline_state
+        } else {
+            &self.polychrome_sprites_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1119,6 +1470,7 @@ impl MetalRenderer {
         &mut self,
         surfaces: &[PaintSurface],
         first_surface: usize,
+        transformed: bool,
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
@@ -1127,7 +1479,11 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        command_encoder.set_render_pipeline_state(if transformed {
+            &self.surfaces_transformed_pipeline_state
+        } else {
+            &self.surfaces_pipeline_state
+        });
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1379,6 +1735,15 @@ struct InstanceBinding {
     offset: usize,
 }
 
+fn bind_spatial_buffers(
+    command_encoder: &metal::RenderCommandEncoderRef,
+    spatial: &(InstanceBinding, InstanceBinding),
+) {
+    let (states, clips) = spatial;
+    command_encoder.set_vertex_buffer(6, Some(&states.buffer), states.offset as u64);
+    command_encoder.set_fragment_buffer(7, Some(&clips.buffer), clips.offset as u64);
+}
+
 struct InstanceBindings {
     quads: InstanceBinding,
     shadows: InstanceBinding,
@@ -1390,12 +1755,23 @@ struct InstanceBindings {
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
-        quads: writer.write(&scene.quads)?,
-        shadows: writer.write(&scene.shadows)?,
-        underlines: writer.write(&scene.underlines)?,
-        monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
-        polychrome_sprites: writer.write(&scene.polychrome_sprites)?,
+        quads: writer.write_iter(scene.quads.iter().map(GpuQuad::from))?,
+        shadows: writer.write_iter(scene.shadows.iter().map(GpuShadow::from))?,
+        underlines: writer.write_iter(scene.underlines.iter().map(GpuUnderline::from))?,
+        monochrome_sprites: writer.write_iter(
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(GpuMonochromeSprite::from),
+        )?,
+        polychrome_sprites: writer.write_iter(
+            scene
+                .polychrome_sprites
+                .iter()
+                .map(GpuPolychromeSprite::from),
+        )?,
         surfaces: writer.write_iter(scene.surfaces.iter().map(|surface| SurfaceBounds {
+            spatial_id: surface.spatial_id,
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
@@ -1466,7 +1842,16 @@ impl InstanceBufferWriter {
         &mut self,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<InstanceBinding> {
-        let (binding, destination) = self.allocate::<T>(values.len())?;
+        let count = values.len();
+        self.write_iter_count(values, count)
+    }
+
+    fn write_iter_count<T>(
+        &mut self,
+        values: impl Iterator<Item = T>,
+        count: usize,
+    ) -> Result<InstanceBinding> {
+        let (binding, destination) = self.allocate::<T>(count)?;
         for (slot, value) in destination.iter_mut().zip(values) {
             slot.write(value);
         }
@@ -1588,6 +1973,7 @@ pub struct PathSprite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
+    pub spatial_id: SpatialId,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
 }

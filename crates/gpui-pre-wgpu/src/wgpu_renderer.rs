@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, SpatialId, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -100,7 +100,203 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SpatialDataBlock([u32; 4]);
+
+fn gpu_spatial_ref(id: SpatialId, word_base: u32) -> SpatialId {
+    if id.is_identity() {
+        SpatialId::IDENTITY
+    } else {
+        SpatialId(word_base + (id.0 - 1) * 8)
+    }
+}
+
+fn spatial_data(scene: &Scene) -> Vec<SpatialDataBlock> {
+    let state_words = scene.spatial_states.len() as u32 * 8;
+    let mut words =
+        Vec::with_capacity(scene.spatial_states.len() * 8 + scene.transform_clips.len() * 10);
+    for (index, state) in scene.spatial_states.iter().enumerate() {
+        for row in state.matrix.rotation_scale {
+            for value in row {
+                words.push(value.to_bits());
+            }
+        }
+        for value in state.matrix.translation {
+            words.push(value.to_bits());
+        }
+        let state_start = index as u32 * 8;
+        words.push(state_words + state.clip_start * 10 - state_start);
+        words.push(state.clip_count);
+    }
+    for clip in &scene.transform_clips {
+        for row in clip.inverse.rotation_scale {
+            for value in row {
+                words.push(value.to_bits());
+            }
+        }
+        for value in clip.inverse.translation {
+            words.push(value.to_bits());
+        }
+        words.push(clip.bounds.origin.x.0.to_bits());
+        words.push(clip.bounds.origin.y.0.to_bits());
+        words.push(clip.bounds.size.width.0.to_bits());
+        words.push(clip.bounds.size.height.0.to_bits());
+    }
+    while words.len() % 4 != 0 {
+        words.push(0);
+    }
+    words
+        .chunks_exact(4)
+        .map(|chunk| SpatialDataBlock([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// GPU records deliberately replace CPU-only draw order with the spatial id.
+/// This keeps the ordinary instance ABI at its pre-transform size.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct GpuQuad {
+    spatial_id: SpatialId,
+    border_style: gpui::BorderStyle,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: gpui::ContentMask<ScaledPixels>,
+    background: Background,
+    border_color: gpui::Hsla,
+    corner_radii: gpui::Corners<ScaledPixels>,
+    border_widths: gpui::Edges<ScaledPixels>,
+}
+
+impl From<&gpui::Quad> for GpuQuad {
+    fn from(value: &gpui::Quad) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            border_style: value.border_style,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            background: value.background,
+            border_color: value.border_color,
+            corner_radii: value.corner_radii,
+            border_widths: value.border_widths,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct GpuShadow {
+    spatial_id: SpatialId,
+    blur_radius: ScaledPixels,
+    bounds: Bounds<ScaledPixels>,
+    corner_radii: gpui::Corners<ScaledPixels>,
+    content_mask: gpui::ContentMask<ScaledPixels>,
+    color: gpui::Hsla,
+    element_bounds: Bounds<ScaledPixels>,
+    element_corner_radii: gpui::Corners<ScaledPixels>,
+    inset: u32,
+    pad: u32,
+}
+
+impl From<&gpui::Shadow> for GpuShadow {
+    fn from(value: &gpui::Shadow) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            blur_radius: value.blur_radius,
+            bounds: value.bounds,
+            corner_radii: value.corner_radii,
+            content_mask: value.content_mask,
+            color: value.color,
+            element_bounds: value.element_bounds,
+            element_corner_radii: value.element_corner_radii,
+            inset: value.inset,
+            pad: value.pad,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct GpuUnderline {
+    spatial_id: SpatialId,
+    pad: u32,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: gpui::ContentMask<ScaledPixels>,
+    color: gpui::Hsla,
+    thickness: ScaledPixels,
+    wavy: gpui::PaddedBool32,
+}
+
+impl From<&gpui::Underline> for GpuUnderline {
+    fn from(value: &gpui::Underline) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            color: value.color,
+            thickness: value.thickness,
+            wavy: value.wavy,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct GpuMonochromeSprite {
+    spatial_id: SpatialId,
+    pad: u32,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: gpui::ContentMask<ScaledPixels>,
+    color: gpui::Hsla,
+    tile: gpui::AtlasTile,
+    transformation: gpui::TransformationMatrix,
+}
+
+impl From<&gpui::MonochromeSprite> for GpuMonochromeSprite {
+    fn from(value: &gpui::MonochromeSprite) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            color: value.color,
+            tile: value.tile,
+            transformation: value.transformation,
+        }
+    }
+}
+
+type GpuSubpixelSprite = GpuMonochromeSprite;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct GpuPolychromeSprite {
+    spatial_id: SpatialId,
+    pad: u32,
+    grayscale: gpui::PaddedBool32,
+    opacity: f32,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: gpui::ContentMask<ScaledPixels>,
+    corner_radii: gpui::Corners<ScaledPixels>,
+    tile: gpui::AtlasTile,
+}
+
+impl From<&gpui::PolychromeSprite> for GpuPolychromeSprite {
+    fn from(value: &gpui::PolychromeSprite) -> Self {
+        Self {
+            spatial_id: value.spatial_id,
+            pad: value.pad,
+            grayscale: value.grayscale,
+            opacity: value.opacity,
+            bounds: value.bounds,
+            content_mask: value.content_mask,
+            corner_radii: value.corner_radii,
+            tile: value.tile,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct PathRasterizationVertex {
     xy_position: Point<ScaledPixels>,
@@ -108,6 +304,27 @@ struct PathRasterizationVertex {
     color: Background,
     bounds: Bounds<ScaledPixels>,
 }
+
+/// Only transformed path batches carry a spatial id per vertex. The ordinary
+/// path record remains byte-for-byte identical to upstream GPUI.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct TransformedPathRasterizationVertex {
+    vertex: PathRasterizationVertex,
+    spatial_id: SpatialId,
+    pad: u32,
+}
+
+// These layouts are shader ABI. Keep the ordinary records at upstream GPUI's
+// original stride; only transformed path vertices are larger.
+const _: [(); 160] = [(); std::mem::size_of::<GpuQuad>()];
+const _: [(); 112] = [(); std::mem::size_of::<GpuShadow>()];
+const _: [(); 104] = [(); std::mem::size_of::<PathRasterizationVertex>()];
+const _: [(); 112] = [(); std::mem::size_of::<TransformedPathRasterizationVertex>()];
+const _: [(); 64] = [(); std::mem::size_of::<GpuUnderline>()];
+const _: [(); 112] = [(); std::mem::size_of::<GpuMonochromeSprite>()];
+const _: [(); 112] = [(); std::mem::size_of::<GpuSubpixelSprite>()];
+const _: [(); 96] = [(); std::mem::size_of::<GpuPolychromeSprite>()];
 
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
@@ -123,13 +340,19 @@ pub struct WgpuSurfaceConfig {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    quads_transformed: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
+    shadows_transformed: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
+    path_rasterization_transformed: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
+    underlines_transformed: wgpu::RenderPipeline,
     mono_sprites: wgpu::RenderPipeline,
+    mono_sprites_transformed: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    poly_sprites_transformed: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -848,12 +1071,14 @@ impl WgpuRenderer {
                                globals_layout: &wgpu::BindGroupLayout,
                                data_layout: &wgpu::BindGroupLayout,
                                texture_layout: Option<&wgpu::BindGroupLayout>,
+                               uses_spatial: bool,
                                topology: wgpu::PrimitiveTopology,
                                color_targets: &[Option<wgpu::ColorTargetState>],
                                sample_count: u32,
                                module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
-            bind_group_layouts.extend(texture_layout.map(Some));
+            bind_group_layouts.push(texture_layout);
+            bind_group_layouts.push(uses_spatial.then_some(&layouts.instances));
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
@@ -902,6 +1127,21 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             None,
+            false,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let quads_transformed = create_pipeline(
+            "quads_transformed",
+            "vs_quad_transformed",
+            "fs_quad_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            true,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -915,6 +1155,21 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             None,
+            false,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let shadows_transformed = create_pipeline(
+            "shadows_transformed",
+            "vs_shadow_transformed",
+            "fs_shadow_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            true,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -928,6 +1183,25 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             None,
+            false,
+            wgpu::PrimitiveTopology::TriangleList,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            path_sample_count,
+            &shader_module,
+        );
+
+        let path_rasterization_transformed = create_pipeline(
+            "path_rasterization_transformed",
+            "vs_path_rasterization_transformed",
+            "fs_path_rasterization_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            true,
             wgpu::PrimitiveTopology::TriangleList,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -958,6 +1232,7 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            false,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
@@ -975,6 +1250,21 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             None,
+            false,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let underlines_transformed = create_pipeline(
+            "underlines_transformed",
+            "vs_underline_transformed",
+            "fs_underline_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            true,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -988,6 +1278,21 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            false,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let mono_sprites_transformed = create_pipeline(
+            "mono_sprites_transformed",
+            "vs_mono_sprite_transformed",
+            "fs_mono_sprite_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            true,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1015,6 +1320,7 @@ impl WgpuRenderer {
                 &layouts.globals,
                 &layouts.instances,
                 Some(&layouts.texture),
+                false,
                 wgpu::PrimitiveTopology::TriangleStrip,
                 &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -1035,6 +1341,21 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.instances,
             Some(&layouts.texture),
+            false,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let poly_sprites_transformed = create_pipeline(
+            "poly_sprites_transformed",
+            "vs_poly_sprite_transformed",
+            "fs_poly_sprite_transformed",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            true,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target.clone())],
             1,
@@ -1048,6 +1369,7 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             None,
+            false,
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -1056,13 +1378,19 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            quads_transformed,
             shadows,
+            shadows_transformed,
             path_rasterization,
+            path_rasterization_transformed,
             paths,
             underlines,
+            underlines_transformed,
             mono_sprites,
+            mono_sprites_transformed,
             subpixel_sprites,
             poly_sprites,
+            poly_sprites_transformed,
             surfaces,
         }
     }
@@ -1404,8 +1732,17 @@ impl WgpuRenderer {
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let mut instance_offset = 0;
+        let (spatial, spatial_word_base) = if scene.spatial_states.is_empty() {
+            (None, 0)
+        } else {
+            let packed_spatial = spatial_data(scene);
+            let binding =
+                self.write_instance_binding("spatial_data", &mut instance_offset, &packed_spatial)?;
+            let word_base = binding.first_instance * 4;
+            (Some(binding), word_base)
+        };
         let instance_bindings = self
-            .write_instances(scene, &mut instance_offset)
+            .write_instances(scene, &mut instance_offset, spatial_word_base)
             .with_context(|| {
                 format!(
                     "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -1444,18 +1781,34 @@ impl WgpuRenderer {
 
             for batch in scene.batches() {
                 match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
-                        instance_range(range),
-                        &mut pass,
-                    ),
+                    PrimitiveBatch::Quads(range) => {
+                        let transformed = !scene.quads[range.start].spatial_id.is_identity();
+                        self.draw_instances(
+                            &instance_bindings.quads,
+                            if transformed {
+                                &self.resources().pipelines.quads_transformed
+                            } else {
+                                &self.resources().pipelines.quads
+                            },
+                            if transformed { spatial.as_ref() } else { None },
+                            instance_range(range),
+                            &mut pass,
+                        )
+                    }
+                    PrimitiveBatch::Shadows(range) => {
+                        let transformed = !scene.shadows[range.start].spatial_id.is_identity();
+                        self.draw_instances(
+                            &instance_bindings.shadows,
+                            if transformed {
+                                &self.resources().pipelines.shadows_transformed
+                            } else {
+                                &self.resources().pipelines.shadows
+                            },
+                            if transformed { spatial.as_ref() } else { None },
+                            instance_range(range),
+                            &mut pass,
+                        )
+                    }
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range];
                         if paths.is_empty() {
@@ -1467,6 +1820,8 @@ impl WgpuRenderer {
                             &mut encoder,
                             paths,
                             &mut instance_offset,
+                            spatial.as_ref(),
+                            spatial_word_base,
                         )?;
 
                         pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1486,25 +1841,44 @@ impl WgpuRenderer {
 
                         if rasterized {
                             self.draw_paths_from_intermediate(
+                                scene,
                                 paths,
                                 &mut instance_offset,
                                 &mut pass,
                             )?;
                         }
                     }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
-                        &instance_bindings.monochrome_sprites,
-                        texture_id,
-                        &self.resources().pipelines.mono_sprites,
-                        instance_range(range),
-                        &mut pass,
-                    ),
+                    PrimitiveBatch::Underlines(range) => {
+                        let transformed = !scene.underlines[range.start].spatial_id.is_identity();
+                        self.draw_instances(
+                            &instance_bindings.underlines,
+                            if transformed {
+                                &self.resources().pipelines.underlines_transformed
+                            } else {
+                                &self.resources().pipelines.underlines
+                            },
+                            if transformed { spatial.as_ref() } else { None },
+                            instance_range(range),
+                            &mut pass,
+                        )
+                    }
+                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                        let transformed = !scene.monochrome_sprites[range.start]
+                            .spatial_id
+                            .is_identity();
+                        self.draw_sprites(
+                            &instance_bindings.monochrome_sprites,
+                            texture_id,
+                            if transformed {
+                                &self.resources().pipelines.mono_sprites_transformed
+                            } else {
+                                &self.resources().pipelines.mono_sprites
+                            },
+                            if transformed { spatial.as_ref() } else { None },
+                            instance_range(range),
+                            &mut pass,
+                        );
+                    }
                     PrimitiveBatch::SubpixelSprites { texture_id, range } => {
                         let resources = self.resources();
                         self.draw_sprites(
@@ -1515,17 +1889,28 @@ impl WgpuRenderer {
                                 .subpixel_sprites
                                 .as_ref()
                                 .unwrap_or(&resources.pipelines.mono_sprites),
+                            None,
                             instance_range(range),
                             &mut pass,
                         );
                     }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self.draw_sprites(
-                        &instance_bindings.polychrome_sprites,
-                        texture_id,
-                        &self.resources().pipelines.poly_sprites,
-                        instance_range(range),
-                        &mut pass,
-                    ),
+                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                        let transformed = !scene.polychrome_sprites[range.start]
+                            .spatial_id
+                            .is_identity();
+                        self.draw_sprites(
+                            &instance_bindings.polychrome_sprites,
+                            texture_id,
+                            if transformed {
+                                &self.resources().pipelines.poly_sprites_transformed
+                            } else {
+                                &self.resources().pipelines.poly_sprites
+                            },
+                            if transformed { spatial.as_ref() } else { None },
+                            instance_range(range),
+                            &mut pass,
+                        );
+                    }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
@@ -1543,37 +1928,69 @@ impl WgpuRenderer {
         &mut self,
         scene: &Scene,
         instance_offset: &mut u64,
+        spatial_word_base: u32,
     ) -> Result<InstanceBindings> {
         Ok(InstanceBindings {
-            quads: self.write_instance_binding(
+            quads: self.write_instance_iter(
                 "quads_bind_group",
                 instance_offset,
-                &scene.quads,
+                scene.quads.iter().map(|value| {
+                    let mut gpu = GpuQuad::from(value);
+                    gpu.spatial_id = gpu_spatial_ref(value.spatial_id, spatial_word_base);
+                    gpu
+                }),
             )?,
-            shadows: self.write_instance_binding(
+            shadows: self.write_instance_iter(
                 "shadows_bind_group",
                 instance_offset,
-                &scene.shadows,
+                scene.shadows.iter().map(|value| {
+                    let mut gpu = GpuShadow::from(value);
+                    gpu.spatial_id = gpu_spatial_ref(value.spatial_id, spatial_word_base);
+                    gpu
+                }),
             )?,
-            underlines: self.write_instance_binding(
+            underlines: self.write_instance_iter(
                 "underlines_bind_group",
                 instance_offset,
-                &scene.underlines,
+                scene.underlines.iter().map(|value| {
+                    let mut gpu = GpuUnderline::from(value);
+                    gpu.spatial_id = gpu_spatial_ref(value.spatial_id, spatial_word_base);
+                    gpu
+                }),
             )?,
-            monochrome_sprites: self.write_instance_binding(
+            monochrome_sprites: self.write_instance_iter(
                 "monochrome_sprites_bind_group",
                 instance_offset,
-                &scene.monochrome_sprites,
+                scene.monochrome_sprites.iter().map(|value| {
+                    let mut gpu = GpuMonochromeSprite::from(value);
+                    gpu.spatial_id = gpu_spatial_ref(value.spatial_id, spatial_word_base);
+                    gpu
+                }),
             )?,
-            subpixel_sprites: self.write_instance_binding(
+            subpixel_sprites: self.write_instance_iter(
                 "subpixel_sprites_bind_group",
                 instance_offset,
-                &scene.subpixel_sprites,
+                scene
+                    .subpixel_sprites
+                    .iter()
+                    .map(|value| GpuSubpixelSprite {
+                        spatial_id: gpu_spatial_ref(value.spatial_id, spatial_word_base),
+                        pad: value.pad,
+                        bounds: value.bounds,
+                        content_mask: value.content_mask,
+                        color: value.color,
+                        tile: value.tile,
+                        transformation: value.transformation,
+                    }),
             )?,
-            polychrome_sprites: self.write_instance_binding(
+            polychrome_sprites: self.write_instance_iter(
                 "polychrome_sprites_bind_group",
                 instance_offset,
-                &scene.polychrome_sprites,
+                scene.polychrome_sprites.iter().map(|value| {
+                    let mut gpu = GpuPolychromeSprite::from(value);
+                    gpu.spatial_id = gpu_spatial_ref(value.spatial_id, spatial_word_base);
+                    gpu
+                }),
             )?,
         })
     }
@@ -1606,6 +2023,7 @@ impl WgpuRenderer {
         &self,
         instances: &InstanceBinding,
         pipeline: &wgpu::RenderPipeline,
+        spatial: Option<&InstanceBinding>,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -1615,6 +2033,9 @@ impl WgpuRenderer {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
+        if let Some(spatial) = spatial {
+            pass.set_bind_group(3, &spatial.bind_group, &[]);
+        }
         pass.draw(
             0..4,
             instances.first_instance + range.start..instances.first_instance + range.end,
@@ -1626,6 +2047,7 @@ impl WgpuRenderer {
         sprite_instances: &InstanceBinding,
         texture_id: AtlasTextureId,
         pipeline: &wgpu::RenderPipeline,
+        spatial: Option<&InstanceBinding>,
         range: Range<u32>,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -1639,6 +2061,9 @@ impl WgpuRenderer {
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
+        if let Some(spatial) = spatial {
+            pass.set_bind_group(3, &spatial.bind_group, &[]);
+        }
         pass.draw(
             0..4,
             sprite_instances.first_instance + range.start
@@ -1657,6 +2082,7 @@ impl WgpuRenderer {
 
     fn draw_paths_from_intermediate(
         &mut self,
+        scene: &Scene,
         paths: &[Path<ScaledPixels>],
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1667,13 +2093,15 @@ impl WgpuRenderer {
             paths
                 .iter()
                 .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
+                    bounds: p.transformed_bounds(scene.spatial_matrix(p.spatial_id)),
                 })
                 .collect()
         } else {
-            let mut bounds = first_path.clipped_bounds();
+            let mut bounds =
+                first_path.transformed_bounds(scene.spatial_matrix(first_path.spatial_id));
             for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
+                bounds =
+                    bounds.union(&path.transformed_bounds(scene.spatial_matrix(path.spatial_id)));
             }
             vec![PathSprite { bounds }]
         };
@@ -1704,27 +2132,51 @@ impl WgpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
         instance_offset: &mut u64,
+        spatial: Option<&InstanceBinding>,
+        spatial_word_base: u32,
     ) -> Result<bool> {
-        let mut vertices = Vec::new();
-        for path in paths {
-            let bounds = path.clipped_bounds();
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds,
-            }));
-        }
-
-        if vertices.is_empty() {
+        let transformed = !paths[0].spatial_id.is_identity();
+        let vertex_count: usize = paths.iter().map(|path| path.vertices.len()).sum();
+        if vertex_count == 0 {
             return Ok(false);
         }
-
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
+        let vertex_binding = if transformed {
+            self.write_instance_iter_count(
+                "path_rasterization_bind_group",
+                instance_offset,
+                paths.iter().flat_map(|path| {
+                    let bounds = path.clipped_bounds();
+                    path.vertices
+                        .iter()
+                        .map(move |v| TransformedPathRasterizationVertex {
+                            vertex: PathRasterizationVertex {
+                                xy_position: v.xy_position,
+                                st_position: v.st_position,
+                                color: path.color,
+                                bounds,
+                            },
+                            spatial_id: gpu_spatial_ref(path.spatial_id, spatial_word_base),
+                            pad: 0,
+                        })
+                }),
+                vertex_count,
+            )?
+        } else {
+            self.write_instance_iter_count(
+                "path_rasterization_bind_group",
+                instance_offset,
+                paths.iter().flat_map(|path| {
+                    let bounds = path.clipped_bounds();
+                    path.vertices.iter().map(move |v| PathRasterizationVertex {
+                        xy_position: v.xy_position,
+                        st_position: v.st_position,
+                        color: path.color,
+                        bounds,
+                    })
+                }),
+                vertex_count,
+            )?
+        };
 
         let resources = self.resources();
         let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
@@ -1753,20 +2205,86 @@ impl WgpuRenderer {
                 ..Default::default()
             });
 
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_pipeline(if transformed {
+                &resources.pipelines.path_rasterization_transformed
+            } else {
+                &resources.pipelines.path_rasterization
+            });
+            if transformed {
+                let spatial = spatial.expect("transformed path batch requires spatial data");
+                pass.set_bind_group(3, &spatial.bind_group, &[]);
+            }
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
             // The path rasterization shader loads records by vertex index
             // rather than instance index, so the allocation's base shifts the
             // vertex range here.
             pass.draw(
-                vertex_binding.first_instance
-                    ..vertex_binding.first_instance + vertices.len() as u32,
+                vertex_binding.first_instance..vertex_binding.first_instance + vertex_count as u32,
                 0..1,
             );
         }
 
         Ok(true)
+    }
+
+    fn write_instance_iter<T>(
+        &mut self,
+        label: &str,
+        instance_offset: &mut u64,
+        instances: impl ExactSizeIterator<Item = T>,
+    ) -> Result<InstanceBinding> {
+        let count = instances.len();
+        self.write_instance_iter_count(label, instance_offset, instances, count)
+    }
+
+    fn write_instance_iter_count<T>(
+        &mut self,
+        label: &str,
+        instance_offset: &mut u64,
+        instances: impl Iterator<Item = T>,
+        count: usize,
+    ) -> Result<InstanceBinding> {
+        if self.uses_webgl_instance_data {
+            let instances: Vec<T> = instances.collect();
+            debug_assert_eq!(instances.len(), count);
+            return self.write_instance_binding(label, instance_offset, &instances);
+        }
+
+        let byte_len = std::mem::size_of::<T>()
+            .checked_mul(count)
+            .context("instance data size overflow")?;
+        let (offset, size, first_instance) =
+            self.allocate_instance_region::<T>(instance_offset, count)?;
+
+        if byte_len != 0 {
+            let resources = self.resources();
+            let InstanceData::Storage(buffer) = &resources.instance_data else {
+                unreachable!("native instance data uses a storage buffer")
+            };
+            let write_size = NonZeroU64::new(
+                u64::try_from(byte_len).context("instance data exceeds addressable buffer size")?,
+            )
+            .expect("non-empty instance data has a non-zero size");
+            let mut staging = resources
+                .queue
+                .write_buffer_with(buffer, offset, write_size)
+                .context("failed to allocate instance staging buffer")?;
+            let stride = std::mem::size_of::<T>();
+            let mut written = 0;
+            for instance in instances {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts((&instance as *const T).cast::<u8>(), stride)
+                };
+                staging
+                    .slice(written..written + stride)
+                    .copy_from_slice(bytes);
+                written += stride;
+            }
+            debug_assert_eq!(written, byte_len);
+        }
+
+        Ok(self.create_instance_binding(label, offset, size, first_instance))
     }
 
     fn write_instance_binding<T>(
@@ -1776,9 +2294,35 @@ impl WgpuRenderer {
         instances: &[T],
     ) -> Result<InstanceBinding> {
         let data = unsafe { Self::instance_bytes(instances) };
+        let (offset, size, first_instance) =
+            self.allocate_instance_region::<T>(instance_offset, instances.len())?;
+
+        let resources = self.resources();
+        if !data.is_empty() {
+            match &resources.instance_data {
+                InstanceData::Storage(buffer) => resources.queue.write_buffer(buffer, offset, data),
+                InstanceData::Texture { .. } => {
+                    Self::write_instance_texture(resources, offset, data)
+                }
+            }
+        }
+        Ok(self.create_instance_binding(label, offset, size, first_instance))
+    }
+
+    fn allocate_instance_region<T>(
+        &mut self,
+        instance_offset: &mut u64,
+        count: usize,
+    ) -> Result<(u64, u64, u32)> {
+        let data_size = u64::try_from(
+            std::mem::size_of::<T>()
+                .checked_mul(count)
+                .context("instance data size overflow")?,
+        )
+        .context("instance data exceeds addressable buffer size")?;
         // wgpu rejects zero-sized bindings, so empty primitive arrays still
         // reserve the 16-byte minimum.
-        let size = (data.len() as u64).max(16);
+        let size = data_size.max(16);
         let stride = (std::mem::size_of::<T>() as u64).max(1);
         let (alignment, allocation_size) = if self.uses_webgl_instance_data {
             // The texture transport has no binding offset: the shader indexes
@@ -1805,16 +2349,17 @@ impl WgpuRenderer {
         } else {
             0
         };
+        Ok((offset, size, first_instance))
+    }
 
+    fn create_instance_binding(
+        &self,
+        label: &str,
+        offset: u64,
+        size: u64,
+        first_instance: u32,
+    ) -> InstanceBinding {
         let resources = self.resources();
-        if !data.is_empty() {
-            match &resources.instance_data {
-                InstanceData::Storage(buffer) => resources.queue.write_buffer(buffer, offset, data),
-                InstanceData::Texture { .. } => {
-                    Self::write_instance_texture(resources, offset, data)
-                }
-            }
-        }
         let bind_group = resources
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1836,10 +2381,10 @@ impl WgpuRenderer {
                     },
                 }],
             });
-        Ok(InstanceBinding {
+        InstanceBinding {
             bind_group,
             first_instance,
-        })
+        }
     }
 
     fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
@@ -2231,13 +2776,17 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
-        assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<GpuQuad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<GpuShadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
+        assert_eq!(
+            std::mem::size_of::<TransformedPathRasterizationVertex>(),
+            28 * 4
+        );
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
-        assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
-        assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<GpuUnderline>(), 16 * 4);
+        assert_eq!(std::mem::size_of::<GpuMonochromeSprite>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<GpuSubpixelSprite>(), 28 * 4);
+        assert_eq!(std::mem::size_of::<GpuPolychromeSprite>(), 24 * 4);
     }
 }

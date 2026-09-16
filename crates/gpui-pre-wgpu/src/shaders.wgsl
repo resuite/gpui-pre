@@ -167,6 +167,33 @@ struct TransformationMatrix {
     translation: vec2<f32>,
 }
 
+struct SpatialState {
+    matrix: TransformationMatrix,
+    // Word distance from this state record to the first cross-space clip.
+    clip_start: u32,
+    clip_count: u32,
+}
+struct TransformedClip {
+    inverse: TransformationMatrix,
+    bounds: Bounds,
+}
+
+fn transform_device_position(position: vec4<f32>, matrix: TransformationMatrix) -> vec4<f32> {
+    let local = (position.xy - vec2<f32>(-1.0, 1.0)) / vec2<f32>(2.0, -2.0) * globals.viewport_size;
+    return to_device_position_impl(transpose(matrix.rotation_scale) * local + matrix.translation);
+}
+
+fn inside_ancestor_clips(position: vec2<f32>, clip_word_start: u32, clip_count: u32) -> bool {
+    for (var i = 0u; i < clip_count; i += 1u) {
+        let clip = load_transform_clip(clip_word_start + i * 10u);
+        let point = transpose(clip.inverse.rotation_scale) * position + clip.inverse.translation;
+        if (any(point < clip.bounds.origin) || any(point > clip.bounds.origin + clip.bounds.size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
     let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
@@ -517,7 +544,7 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 // --- quads --- //
 
 struct Quad {
-    order: u32,
+    spatial_id: u32,
     border_style: u32,
     bounds: Bounds,
     content_mask: Bounds,
@@ -561,17 +588,16 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     return out;
 }
 
-@fragment
-fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
-    // Alpha clip first, since we don't have `clip_distance`.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
-
-    let quad = load_quad(input.quad_id);
-
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
-        input.background_solid, input.background_color0, input.background_color1);
+fn quad_fragment_impl(
+    quad: Quad,
+    local_position: vec2<f32>,
+    border_color: vec4<f32>,
+    background_solid: vec4<f32>,
+    background_color0: vec4<f32>,
+    background_color1: vec4<f32>,
+) -> vec4<f32> {
+    let background_color = gradient_color(quad.background, local_position, quad.bounds,
+        background_solid, background_color0, background_color1);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -589,7 +615,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let size = quad.bounds.size;
     let half_size = size / 2.0;
-    let point = input.position.xy - quad.bounds.origin;
+    let point = local_position - quad.bounds.origin;
     let center_to_point = point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -686,7 +712,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     var color = background_color;
     if (border_sdf < antialias_threshold) {
-        var border_color = input.border_color;
+        var border_color = border_color;
 
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
@@ -892,6 +918,17 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     return blend_color(color, saturate(antialias_threshold - outer_sdf));
 }
 
+@fragment
+fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return quad_fragment_impl(
+        load_quad(input.quad_id), input.position.xy, input.border_color,
+        input.background_solid, input.background_color0, input.background_color1);
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
@@ -948,7 +985,7 @@ fn fmod(a: f32, b: f32) -> f32 {
 // --- shadows --- //
 
 struct Shadow {
-    order: u32,
+    spatial_id: u32,
     blur_radius: f32,
     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
     bounds: Bounds,
@@ -996,23 +1033,16 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     return out;
 }
 
-@fragment
-fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
-    // Alpha clip first, since we don't have `clip_distance`.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
-
-    let shadow = load_shadow(input.shadow_id);
+fn shadow_fragment_impl(shadow: Shadow, local_position: vec2<f32>, color: vec4<f32>) -> vec4<f32> {
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
-    let center_to_point = input.position.xy - center;
+    let center_to_point = local_position - center;
 
     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf(local_position, shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1037,12 +1067,21 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+        let element_distance = quad_sdf(local_position, shadow.element_bounds,
                                         shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
 
-    return blend_color(input.color, alpha);
+    return blend_color(color, alpha);
+}
+
+@fragment
+fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return shadow_fragment_impl(load_shadow(input.shadow_id), input.position.xy, input.color);
 }
 
 // --- path rasterization --- //
@@ -1052,6 +1091,12 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+}
+
+struct TransformedPathRasterizationVertex {
+    vertex: PathRasterizationVertex,
+    spatial_id: u32,
+    pad: u32,
 }
 
 
@@ -1076,15 +1121,13 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     return out;
 }
 
-@fragment
-fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f32> {
-    let dx = dpdx(input.st_position);
-    let dy = dpdy(input.st_position);
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
-
-    let v = load_path_vertex(input.vertex_id);
+fn path_rasterization_fragment_impl(
+    v: PathRasterizationVertex,
+    st_position: vec2<f32>,
+    local_position: vec2<f32>,
+    dx: vec2<f32>,
+    dy: vec2<f32>,
+) -> vec4<f32> {
     let background = v.color;
     let bounds = v.bounds;
 
@@ -1093,8 +1136,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         // If the gradient is too small, return a solid color.
         alpha = 1.0;
     } else {
-        let gradient = 2.0 * input.st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
-        let f = input.st_position.x * input.st_position.x - input.st_position.y;
+        let gradient = 2.0 * st_position.xx * vec2<f32>(dx.x, dy.x) - vec2<f32>(dx.y, dy.y);
+        let f = st_position.x * st_position.x - st_position.y;
         let distance = f / length(gradient);
         alpha = saturate(0.5 - distance);
     }
@@ -1104,9 +1147,20 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, local_position, bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
+}
+
+@fragment
+fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f32> {
+    let dx = dpdx(input.st_position);
+    let dy = dpdy(input.st_position);
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return path_rasterization_fragment_impl(
+        load_path_vertex(input.vertex_id), input.st_position, input.position.xy, dx, dy);
 }
 
 // --- paths --- //
@@ -1147,7 +1201,7 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
 // --- underlines --- //
 
 struct Underline {
-    order: u32,
+    spatial_id: u32,
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
@@ -1178,25 +1232,16 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     return out;
 }
 
-@fragment
-fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
+fn underline_fragment_impl(underline: Underline, local_position: vec2<f32>, color: vec4<f32>) -> vec4<f32> {
     const WAVE_FREQUENCY: f32 = 2.0;
-    const WAVE_HEIGHT_RATIO: f32 = 0.8;
-
-    // Alpha clip first, since we don't have `clip_distance`.
-    if (any(input.clip_distances < vec4<f32>(0.0))) {
-        return vec4<f32>(0.0);
-    }
-
-    let underline = load_underline(input.underline_id);
-    if (underline.wavy == 0u)
+    const WAVE_HEIGHT_RATIO: f32 = 0.8;    if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(color, color.a);
     }
 
     let half_thickness = underline.thickness * 0.5;
 
-    let st = (input.position.xy - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
+    let st = (local_position - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
     let frequency = M_PI_F * WAVE_FREQUENCY * underline.thickness / underline.bounds.size.y;
     let amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1207,13 +1252,22 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(color, alpha * color.a);
+}
+
+@fragment
+fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    return underline_fragment_impl(load_underline(input.underline_id), input.position.xy, input.color);
 }
 
 // --- monochrome sprites --- //
 
 struct MonochromeSprite {
-    order: u32,
+    spatial_id: u32,
     pad: u32,
     bounds: Bounds,
     content_mask: Bounds,
@@ -1260,7 +1314,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
 // --- polychrome sprites --- //
 
 struct PolychromeSprite {
-    order: u32,
+    spatial_id: u32,
     pad: u32,
     grayscale: u32,
     opacity: f32,
@@ -1308,6 +1362,272 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+}
+
+// --- sparse transformed entry points --- //
+
+struct QuadTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) border_color: vec4<f32>,
+    @location(1) @interpolate(flat) quad_id: u32,
+    // TODO: use `clip_distance` once Naga supports it
+    @location(2) clip_distances: vec4<f32>,
+    @location(3) @interpolate(flat) background_solid: vec4<f32>,
+    @location(4) @interpolate(flat) background_color0: vec4<f32>,
+    @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_quad_transformed(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> QuadTransformedVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let quad = load_quad(instance_id);
+    let spatial_word = quad.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var out = QuadTransformedVarying();
+    out.position = to_device_position(unit_vertex, quad.bounds);
+
+    let gradient = prepare_gradient_color(
+        quad.background.tag,
+        quad.background.color_space,
+        quad.background.solid,
+        quad.background.colors
+    );
+    out.background_solid = gradient.solid;
+    out.background_color0 = gradient.color0;
+    out.background_color1 = gradient.color1;
+    out.border_color = hsla_to_rgba(quad.border_color);
+    out.quad_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.local_position = quad.bounds.origin + unit_vertex * quad.bounds.size;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_quad_transformed(input: QuadTransformedVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+    return quad_fragment_impl(
+        load_quad(input.quad_id), input.local_position, input.border_color,
+        input.background_solid, input.background_color0, input.background_color1);
+}
+
+struct ShadowTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    @location(1) @interpolate(flat) shadow_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(3) clip_distances: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_shadow_transformed(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ShadowTransformedVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var shadow = load_shadow(instance_id);
+    let spatial_word = shadow.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var geometry: Bounds;
+    if (shadow.inset != 0u) {
+        geometry = shadow.element_bounds;
+    } else {
+        // Leave room for the gaussian tail outside the shadow rect.
+        let margin = 3.0 * shadow.blur_radius;
+        geometry = shadow.bounds;
+        geometry.origin -= vec2<f32>(margin);
+        geometry.size += 2.0 * vec2<f32>(margin);
+    }
+
+    var out = ShadowTransformedVarying();
+    out.position = to_device_position(unit_vertex, geometry);
+    out.color = hsla_to_rgba(shadow.color);
+    out.shadow_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.local_position = geometry.origin + unit_vertex * geometry.size;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_shadow_transformed(input: ShadowTransformedVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+    return shadow_fragment_impl(load_shadow(input.shadow_id), input.local_position, input.color);
+}
+
+struct UnderlineTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    @location(1) @interpolate(flat) underline_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(3) clip_distances: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_underline_transformed(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> UnderlineTransformedVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let underline = load_underline(instance_id);
+    let spatial_word = underline.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var out = UnderlineTransformedVarying();
+    out.position = to_device_position(unit_vertex, underline.bounds);
+    out.color = hsla_to_rgba(underline.color);
+    out.underline_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
+    out.local_position = underline.bounds.origin + unit_vertex * underline.bounds.size;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_underline_transformed(input: UnderlineTransformedVarying) -> @location(0) vec4<f32> {
+    // Alpha clip first, since we don't have `clip_distance`.
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+    return underline_fragment_impl(load_underline(input.underline_id), input.local_position, input.color);
+}
+
+struct MonoSpriteTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) tile_position: vec2<f32>,
+    @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(3) clip_distances: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_mono_sprite_transformed(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> MonoSpriteTransformedVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = load_mono_sprite(instance_id);
+    let spatial_word = sprite.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var out = MonoSpriteTransformedVarying();
+    out.position = to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation);
+
+    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.color = hsla_to_rgba(sprite.color);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_mono_sprite_transformed(input: MonoSpriteTransformedVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+
+    return blend_color(input.color, alpha_corrected);
+}
+
+struct PolySpriteTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) tile_position: vec2<f32>,
+    @location(1) @interpolate(flat) sprite_id: u32,
+    @location(3) clip_distances: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_poly_sprite_transformed(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> PolySpriteTransformedVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = load_poly_sprite(instance_id);
+    let spatial_word = sprite.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var out = PolySpriteTransformedVarying();
+    out.position = to_device_position(unit_vertex, sprite.bounds);
+    out.tile_position = to_tile_position(unit_vertex, sprite.tile);
+    out.sprite_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.local_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_poly_sprite_transformed(input: PolySpriteTransformedVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    // Alpha clip after using the derivatives.
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+
+    let sprite = load_poly_sprite(input.sprite_id);
+    let distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
+
+    var color = sample;
+    if (sprite.grayscale != 0u) {
+        let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
+        color = vec4<f32>(vec3<f32>(grayscale), sample.a);
+    }
+    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+}
+
+struct PathRasterizationTransformedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) st_position: vec2<f32>,
+    @location(1) @interpolate(flat) vertex_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(3) clip_distances: vec4<f32>,
+    @location(6) local_position: vec2<f32>,
+    @location(7) @interpolate(flat) clip_range: vec2<u32>,
+}
+
+@vertex
+fn vs_path_rasterization_transformed(@builtin(vertex_index) vertex_id: u32) -> PathRasterizationTransformedVarying {
+    let transformed = load_transformed_path_vertex(vertex_id);
+    let v = transformed.vertex;
+    let spatial_word = transformed.spatial_id;
+    let spatial = load_spatial_state(spatial_word);
+
+    var out = PathRasterizationTransformedVarying();
+    out.position = to_device_position_impl(v.xy_position);
+    out.st_position = v.st_position;
+    out.vertex_id = vertex_id;
+    out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
+    out.local_position = v.xy_position;
+    out.clip_range = vec2<u32>(spatial_word + spatial.clip_start, spatial.clip_count);
+    out.position = transform_device_position(out.position, spatial.matrix);
+    return out;
+}
+
+@fragment
+fn fs_path_rasterization_transformed(input: PathRasterizationTransformedVarying) -> @location(0) vec4<f32> {
+    let dx = dpdx(input.st_position);
+    let dy = dpdy(input.st_position);
+    if (any(input.clip_distances < vec4<f32>(0.0)) || !inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
+        return vec4<f32>(0.0);
+    }
+    return path_rasterization_fragment_impl(
+        load_transformed_path_vertex(input.vertex_id).vertex,
+        input.st_position, input.local_position, dx, dy);
 }
 
 // --- surfaces --- //

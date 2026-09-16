@@ -175,6 +175,14 @@ fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
     );
 }
 
+fn load_transformed_path_vertex(vertex_id: u32) -> TransformedPathRasterizationVertex {
+    var cursor = instance_cursor(vertex_id * 28u);
+    let vertex = PathRasterizationVertex(
+        read_vec2_f32(&cursor), read_vec2_f32(&cursor), read_background(&cursor), read_bounds(&cursor)
+    );
+    return TransformedPathRasterizationVertex(vertex, read_word(&cursor), read_word(&cursor));
+}
+
 fn load_path_sprite(instance_id: u32) -> PathSprite {
     var cursor = instance_cursor(instance_id * 4u);
     return PathSprite(read_bounds(&cursor));
@@ -217,5 +225,29 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_corners(&cursor),
         read_atlas_tile(&cursor),
+    );
+}
+
+@group(3) @binding(0) var t_spatial_data: texture_2d<u32>;
+fn spatial_word(index: u32) -> u32 {
+    let width = textureDimensions(t_spatial_data).x;
+    let texel = index / 4u;
+    return textureLoad(t_spatial_data, vec2<i32>(i32(texel % width), i32(texel / width)), 0)[index % 4u];
+}
+fn spatial_f32(index: u32) -> f32 { return bitcast<f32>(spatial_word(index)); }
+fn load_spatial_state(start: u32) -> SpatialState {
+    return SpatialState(
+        TransformationMatrix(
+            mat2x2<f32>(vec2<f32>(spatial_f32(start), spatial_f32(start+1u)), vec2<f32>(spatial_f32(start+2u), spatial_f32(start+3u))),
+            vec2<f32>(spatial_f32(start+4u), spatial_f32(start+5u))
+        ), spatial_word(start+6u), spatial_word(start+7u)
+    );
+}
+fn load_transform_clip(start: u32) -> TransformedClip {
+    return TransformedClip(
+        TransformationMatrix(
+            mat2x2<f32>(vec2<f32>(spatial_f32(start), spatial_f32(start+1u)), vec2<f32>(spatial_f32(start+2u), spatial_f32(start+3u))),
+            vec2<f32>(spatial_f32(start+4u), spatial_f32(start+5u))
+        ), Bounds(vec2<f32>(spatial_f32(start+6u), spatial_f32(start+7u)), vec2<f32>(spatial_f32(start+8u), spatial_f32(start+9u)))
     );
 }

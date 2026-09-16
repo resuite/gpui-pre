@@ -3,6 +3,32 @@
 
 using namespace metal;
 
+
+float2 apply_affine(TransformationMatrix matrix, float2 position) {
+  return float2(dot(float2(matrix.rotation_scale[0][0], matrix.rotation_scale[0][1]), position),
+                dot(float2(matrix.rotation_scale[1][0], matrix.rotation_scale[1][1]), position))
+       + float2(matrix.translation[0], matrix.translation[1]);
+}
+
+float4 transform_device_position(float4 position, TransformationMatrix matrix,
+                                 constant Size_DevicePixels *viewport_size) {
+  float2 viewport = float2(viewport_size->width, viewport_size->height);
+  float2 local = (position.xy - float2(-1., 1.)) / float2(2., -2.) * viewport;
+  float2 transformed = apply_affine(matrix, local);
+  float2 transformed_device = transformed / viewport * float2(2., -2.) + float2(-1., 1.);
+  return float4(transformed_device, position.z, position.w);
+}
+
+void clip_ancestors(float2 position, uint2 range, constant TransformedClip *clips) {
+  for (uint i = 0; i < range.y; ++i) {
+    TransformedClip clip = clips[range.x + i];
+    float2 point = apply_affine(clip.inverse, position);
+    float2 origin = float2(clip.bounds.origin.x, clip.bounds.origin.y);
+    float2 end = origin + float2(clip.bounds.size.width, clip.bounds.size.height);
+    if (any(point < origin) || any(point > end)) discard_fragment();
+  }
+}
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -67,12 +93,12 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     uint quad_id [[instance_id]],
                                     constant float2 *unit_vertices
                                     [[buffer(QuadInputIndex_Vertices)]],
-                                    constant Quad *quads
+                                    constant GpuQuad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
                                     constant Size_DevicePixels *viewport_size
                                     [[buffer(QuadInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Quad quad = quads[quad_id];
+  GpuQuad quad = quads[quad_id];
   float4 device_position =
       to_device_position(unit_vertex, quad.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
@@ -97,12 +123,15 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
-  Quad quad = quads[input.quad_id];
-  float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
-    input.background_solid, input.background_color0, input.background_color1);
+float4 quad_fragment_impl(
+    GpuQuad quad,
+    float2 local_position,
+    float4 border_color,
+    float4 background_solid,
+    float4 background_color0,
+    float4 background_color1) {
+  float4 background_color = fill_color(quad.background, local_position, quad.bounds,
+    background_solid, background_color0, background_color1);
 
   bool unrounded = quad.corner_radii.top_left == 0.0 &&
     quad.corner_radii.bottom_left == 0.0 &&
@@ -120,7 +149,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
   float2 half_size = size / 2.0;
-  float2 point = input.position.xy - float2(quad.bounds.origin.x, quad.bounds.origin.y);
+  float2 point = local_position - float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float2 center_to_point = point - half_size;
 
   // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -210,7 +239,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   float4 color = background_color;
   if (border_sdf < antialias_threshold) {
-    float4 border_color = input.border_color;
+    float4 border_color = border_color;
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -396,6 +425,14 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
 }
 
+fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                              constant GpuQuad *quads
+                              [[buffer(QuadInputIndex_Quads)]]) {
+  return quad_fragment_impl(
+      quads[input.quad_id], input.position.xy, input.border_color,
+      input.background_solid, input.background_color0, input.background_color1);
+}
+
 // Returns the dash velocity of a corner given the dash velocity of the two
 // sides, by returning the slower velocity (larger dashes).
 //
@@ -462,11 +499,11 @@ struct ShadowFragmentInput {
 vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
-    constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
+    constant GpuShadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Shadow shadow = shadows[shadow_id];
+  GpuShadow shadow = shadows[shadow_id];
 
   Bounds_ScaledPixels bounds;
   if (shadow.inset != 0u) {
@@ -494,16 +531,13 @@ vertex ShadowVertexOutput shadow_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
-                                constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
-  Shadow shadow = shadows[input.shadow_id];
+float4 shadow_fragment_impl(GpuShadow shadow, float2 local_position, float4 color) {
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
   float2 size = float2(shadow.bounds.size.width, shadow.bounds.size.height);
   float2 half_size = size / 2.;
   float2 center = origin + half_size;
-  float2 point = input.position.xy - center;
+  float2 point = local_position - center;
   float corner_radius;
   if (point.x < 0.) {
     if (point.y < 0.) {
@@ -521,7 +555,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(local_position, shadow.bounds, shadow.corner_radii);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -546,12 +580,18 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+    float element_distance = quad_sdf(local_position, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  return color * float4(1., 1., 1., alpha);
+}
+
+fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+                                constant GpuShadow *shadows
+                                [[buffer(ShadowInputIndex_Shadows)]]) {
+  return shadow_fragment_impl(shadows[input.shadow_id], input.position.xy, input.color);
 }
 
 struct UnderlineVertexOutput {
@@ -570,11 +610,11 @@ struct UnderlineFragmentInput {
 vertex UnderlineVertexOutput underline_vertex(
     uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
-    constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
+    constant GpuUnderline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  Underline underline = underlines[underline_id];
+  GpuUnderline underline = underlines[underline_id];
   float4 device_position =
       to_device_position(unit_vertex, underline.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
@@ -587,19 +627,16 @@ vertex UnderlineVertexOutput underline_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
-                                   constant Underline *underlines
-                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
+float4 underline_fragment_impl(GpuUnderline underline, float2 local_position, float4 color) {
   const float WAVE_FREQUENCY = 2.0;
   const float WAVE_HEIGHT_RATIO = 0.8;
 
-  Underline underline = underlines[input.underline_id];
   if (underline.wavy) {
     float half_thickness = underline.thickness * 0.5;
     float2 origin =
         float2(underline.bounds.origin.x, underline.bounds.origin.y);
 
-    float2 st = ((input.position.xy - origin) / underline.bounds.size.height) -
+    float2 st = ((local_position - origin) / underline.bounds.size.height) -
                 float2(0., 0.5);
     float frequency = (M_PI_F * WAVE_FREQUENCY * underline.thickness) / underline.bounds.size.height;
     float amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.height;
@@ -612,10 +649,16 @@ fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
     float distance_from_bottom_border = distance_in_pixels + half_thickness;
     float alpha = saturate(
         0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return input.color * float4(1., 1., 1., alpha);
+    return color * float4(1., 1., 1., alpha);
   } else {
-    return input.color;
+    return color;
   }
+}
+
+fragment float4 underline_fragment(UnderlineFragmentInput input [[stage_in]],
+                                   constant GpuUnderline *underlines
+                                   [[buffer(UnderlineInputIndex_Underlines)]]) {
+  return underline_fragment_impl(underlines[input.underline_id], input.position.xy, input.color);
 }
 
 struct MonochromeSpriteVertexOutput {
@@ -635,13 +678,13 @@ struct MonochromeSpriteFragmentInput {
 vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant GpuMonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  MonochromeSprite sprite = sprites[sprite_id];
+  GpuMonochromeSprite sprite = sprites[sprite_id];
   float4 device_position =
       to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
@@ -657,7 +700,7 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
 
 fragment float4 monochrome_sprite_fragment(
     MonochromeSpriteFragmentInput input [[stage_in]],
-    constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant GpuMonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
@@ -688,14 +731,14 @@ struct PolychromeSpriteFragmentInput {
 vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant GpuPolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     constant Size_DevicePixels *viewport_size
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
 
   float2 unit_vertex = unit_vertices[unit_vertex_id];
-  PolychromeSprite sprite = sprites[sprite_id];
+  GpuPolychromeSprite sprite = sprites[sprite_id];
   float4 device_position =
       to_device_position(unit_vertex, sprite.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
@@ -710,9 +753,9 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
 
 fragment float4 polychrome_sprite_fragment(
     PolychromeSpriteFragmentInput input [[stage_in]],
-    constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant GpuPolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
     texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]]) {
-  PolychromeSprite sprite = sprites[input.sprite_id];
+  GpuPolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
@@ -769,14 +812,11 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
   };
 }
 
-fragment float4 path_rasterization_fragment(
-  PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
-) {
-  float2 dx = dfdx(input.st_position);
-  float2 dy = dfdy(input.st_position);
+float4 path_rasterization_fragment_impl(
+    PathRasterizationVertex v, float2 st_position, float2 local_position) {
+  float2 dx = dfdx(st_position);
+  float2 dy = dfdy(st_position);
 
-  PathRasterizationVertex v = vertices[input.vertex_id];
   Background background = v.color;
   Bounds_ScaledPixels path_bounds = v.bounds;
   float alpha;
@@ -784,10 +824,10 @@ fragment float4 path_rasterization_fragment(
     alpha = 1.0;
   } else {
     float2 gradient = float2(
-      (2. * input.st_position.x) * dx.x - dx.y,
-      (2. * input.st_position.x) * dy.x - dy.y
+      (2. * st_position.x) * dx.x - dx.y,
+      (2. * st_position.x) * dy.x - dy.y
     );
-    float f = (input.st_position.x * input.st_position.x) - input.st_position.y;
+    float f = (st_position.x * st_position.x) - st_position.y;
     float distance = f / length(gradient);
     alpha = saturate(0.5 - distance);
   }
@@ -802,13 +842,21 @@ fragment float4 path_rasterization_fragment(
 
   float4 color = fill_color(
     background,
-    input.position.xy,
+    local_position,
     path_bounds,
     gradient_color.solid,
     gradient_color.color0,
     gradient_color.color1
   );
   return float4(color.rgb * color.a * alpha, alpha * color.a);
+}
+
+fragment float4 path_rasterization_fragment(
+  PathRasterizationFragmentInput input [[stage_in]],
+  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+) {
+  return path_rasterization_fragment_impl(
+      vertices[input.vertex_id], input.st_position, input.position.xy);
 }
 
 struct PathSpriteVertexOutput {
@@ -886,6 +934,452 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
                                  [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  const float4x4 ycbcrToRGBTransform =
+      float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
+               float4(+0.0000f, -0.3441f, +1.7720f, +0.0000f),
+               float4(+1.4020f, -0.7141f, +0.0000f, +0.0000f),
+               float4(-0.7010f, +0.5291f, -0.8860f, +1.0000f));
+  float4 ycbcr = float4(
+      y_texture.sample(texture_sampler, input.texture_position).r,
+      cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
+
+  return ycbcrToRGBTransform * ycbcr;
+}
+
+
+
+// --- sparse transformed entry points ---
+
+struct QuadTransformedVertexOutput {
+  uint quad_id [[flat]];
+  float4 position [[position]];
+  float4 border_color [[flat]];
+  float4 background_solid [[flat]];
+  float4 background_color0 [[flat]];
+  float4 background_color1 [[flat]];
+  float clip_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct QuadTransformedFragmentInput {
+  uint quad_id [[flat]];
+  float4 position [[position]];
+  float4 border_color [[flat]];
+  float4 background_solid [[flat]];
+  float4 background_color0 [[flat]];
+  float4 background_color1 [[flat]];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex QuadTransformedVertexOutput quad_vertex_transformed(uint unit_vertex_id [[vertex_id]],
+                                    uint quad_id [[instance_id]],
+                                    constant float2 *unit_vertices
+                                    [[buffer(QuadInputIndex_Vertices)]],
+                                    constant GpuQuad *quads
+                                    [[buffer(QuadInputIndex_Quads)]],
+                                    constant Size_DevicePixels *viewport_size
+                                    [[buffer(QuadInputIndex_ViewportSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GpuQuad quad = quads[quad_id];
+  SpatialState spatial = spatial_states[quad.spatial_id - 1];
+  float4 device_position =
+      to_device_position(unit_vertex, quad.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds,
+                                                 quad.content_mask.bounds);
+  float4 border_color = hsla_to_rgba(quad.border_color);
+
+  GradientColor gradient = prepare_fill_color(
+    quad.background.tag,
+    quad.background.color_space,
+    quad.background.solid,
+    quad.background.colors[0].color,
+    quad.background.colors[1].color
+  );
+
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return QuadTransformedVertexOutput{
+      quad_id,
+      device_position,
+      border_color,
+      gradient.solid,
+      gradient.color0,
+      gradient.color1,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(quad.bounds.origin.x, quad.bounds.origin.y) + unit_vertex * float2(quad.bounds.size.width, quad.bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 quad_fragment_transformed(QuadTransformedFragmentInput input [[stage_in]],
+                              constant GpuQuad *quads
+                              [[buffer(QuadInputIndex_Quads)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  return quad_fragment_impl(
+      quads[input.quad_id], input.local_position, input.border_color,
+      input.background_solid, input.background_color0, input.background_color1);
+}
+
+struct ShadowTransformedVertexOutput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  uint shadow_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct ShadowTransformedFragmentInput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  uint shadow_id [[flat]];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex ShadowTransformedVertexOutput shadow_vertex_transformed(
+    uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
+    constant GpuShadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GpuShadow shadow = shadows[shadow_id];
+  SpatialState spatial = spatial_states[shadow.spatial_id - 1];
+
+  Bounds_ScaledPixels bounds;
+  if (shadow.inset != 0u) {
+    bounds = shadow.element_bounds;
+  } else {
+    // Leave room for the gaussian tail outside the shadow rect.
+    float margin = 3. * shadow.blur_radius;
+    bounds = shadow.bounds;
+    bounds.origin.x -= margin;
+    bounds.origin.y -= margin;
+    bounds.size.width += 2. * margin;
+    bounds.size.height += 2. * margin;
+  }
+
+  float4 device_position =
+      to_device_position(unit_vertex, bounds, viewport_size);
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, bounds, shadow.content_mask.bounds);
+  float4 color = hsla_to_rgba(shadow.color);
+
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return ShadowTransformedVertexOutput{
+      device_position,
+      color,
+      shadow_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(bounds.origin.x, bounds.origin.y) + unit_vertex * float2(bounds.size.width, bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 shadow_fragment_transformed(ShadowTransformedFragmentInput input [[stage_in]],
+                                constant GpuShadow *shadows
+                                [[buffer(ShadowInputIndex_Shadows)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  return shadow_fragment_impl(shadows[input.shadow_id], input.local_position, input.color);
+}
+
+struct UnderlineTransformedVertexOutput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  uint underline_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct UnderlineTransformedFragmentInput {
+  float4 position [[position]];
+  float4 color [[flat]];
+  uint underline_id [[flat]];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex UnderlineTransformedVertexOutput underline_vertex_transformed(
+    uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
+    constant GpuUnderline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ShadowInputIndex_ViewportSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GpuUnderline underline = underlines[underline_id];
+  SpatialState spatial = spatial_states[underline.spatial_id - 1];
+  float4 device_position =
+      to_device_position(unit_vertex, underline.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
+                                                 underline.content_mask.bounds);
+  float4 color = hsla_to_rgba(underline.color);
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return UnderlineTransformedVertexOutput{
+      device_position,
+      color,
+      underline_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(underline.bounds.origin.x, underline.bounds.origin.y) + unit_vertex * float2(underline.bounds.size.width, underline.bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 underline_fragment_transformed(UnderlineTransformedFragmentInput input [[stage_in]],
+                                   constant GpuUnderline *underlines
+                                   [[buffer(UnderlineInputIndex_Underlines)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  return underline_fragment_impl(underlines[input.underline_id], input.local_position, input.color);
+}
+
+struct MonochromeSpriteTransformedVertexOutput {
+  float4 position [[position]];
+  float2 tile_position;
+  float4 color [[flat]];
+  float4 clip_distance;
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct MonochromeSpriteTransformedFragmentInput {
+  float4 position [[position]];
+  float2 tile_position;
+  float4 color [[flat]];
+  float4 clip_distance;
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex MonochromeSpriteTransformedVertexOutput monochrome_sprite_vertex_transformed(
+    uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
+    constant GpuMonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SpriteInputIndex_ViewportSize)]],
+    constant Size_DevicePixels *atlas_size
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GpuMonochromeSprite sprite = sprites[sprite_id];
+  SpatialState spatial = spatial_states[sprite.spatial_id - 1];
+  float4 device_position =
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
+                                                 sprite.content_mask.bounds, sprite.transformation);
+  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  float4 color = hsla_to_rgba(sprite.color);
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return MonochromeSpriteTransformedVertexOutput{
+      device_position,
+      tile_position,
+      color,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 monochrome_sprite_fragment_transformed(
+    MonochromeSpriteTransformedFragmentInput input [[stage_in]],
+    constant GpuMonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  if (any(input.clip_distance < float4(0.0))) {
+    return float4(0.0);
+  }
+
+  constexpr sampler atlas_texture_sampler(mag_filter::linear,
+                                          min_filter::linear);
+  float4 sample =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float4 color = input.color;
+  color.a *= sample.a;
+  return color;
+}
+
+struct PolychromeSpriteTransformedVertexOutput {
+  float4 position [[position]];
+  float2 tile_position;
+  uint sprite_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct PolychromeSpriteTransformedFragmentInput {
+  float4 position [[position]];
+  float2 tile_position;
+  uint sprite_id [[flat]];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex PolychromeSpriteTransformedVertexOutput polychrome_sprite_vertex_transformed(
+    uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
+    constant GpuPolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SpriteInputIndex_ViewportSize)]],
+    constant Size_DevicePixels *atlas_size
+    [[buffer(SpriteInputIndex_AtlasTextureSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  GpuPolychromeSprite sprite = sprites[sprite_id];
+  SpatialState spatial = spatial_states[sprite.spatial_id - 1];
+  float4 device_position =
+      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
+                                                 sprite.content_mask.bounds);
+  float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return PolychromeSpriteTransformedVertexOutput{
+      device_position,
+      tile_position,
+      sprite_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 polychrome_sprite_fragment_transformed(
+    PolychromeSpriteTransformedFragmentInput input [[stage_in]],
+    constant GpuPolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+    texture2d<float> atlas_texture [[texture(SpriteInputIndex_AtlasTexture)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  GpuPolychromeSprite sprite = sprites[input.sprite_id];
+  constexpr sampler atlas_texture_sampler(mag_filter::linear,
+                                          min_filter::linear);
+  float4 sample =
+      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float distance =
+      quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
+
+  float4 color = sample;
+  if (sprite.grayscale) {
+    float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+    color.r = grayscale;
+    color.g = grayscale;
+    color.b = grayscale;
+  }
+  color.a *= sprite.opacity * saturate(0.5 - distance);
+  return color;
+}
+
+struct PathRasterizationTransformedVertexOutput {
+  float4 position [[position]];
+  float2 st_position;
+  uint vertex_id [[flat]];
+  float clip_rect_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct PathRasterizationTransformedFragmentInput {
+  float4 position [[position]];
+  float2 st_position;
+  uint vertex_id [[flat]];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex PathRasterizationTransformedVertexOutput path_rasterization_vertex_transformed(
+  uint vertex_id [[vertex_id]],
+  constant TransformedPathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+,
+  constant SpatialState *spatial_states [[buffer(6)]]) {
+  TransformedPathRasterizationVertex transformed = vertices[vertex_id];
+  PathRasterizationVertex v = transformed.path_vertex;
+  SpatialState spatial = spatial_states[transformed.spatial_id - 1];
+  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
+  float4 position = float4(
+    vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
+    0.,
+    1.
+  );
+  position = transform_device_position(position, spatial.matrix, atlas_size);
+  return PathRasterizationTransformedVertexOutput{
+      position,
+      float2(v.st_position.x, v.st_position.y),
+      vertex_id,
+      {
+        v.xy_position.x - v.bounds.origin.x,
+        v.bounds.origin.x + v.bounds.size.width - v.xy_position.x,
+        v.xy_position.y - v.bounds.origin.y,
+        v.bounds.origin.y + v.bounds.size.height - v.xy_position.y
+      }
+  ,
+      vertex_position,
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 path_rasterization_fragment_transformed(
+  PathRasterizationTransformedFragmentInput input [[stage_in]],
+  constant TransformedPathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
+  constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
+  return path_rasterization_fragment_impl(
+      vertices[input.vertex_id].path_vertex, input.st_position, input.local_position);
+}
+
+struct SurfaceTransformedVertexOutput {
+  float4 position [[position]];
+  float2 texture_position;
+  float clip_distance [[clip_distance]][4];
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+struct SurfaceTransformedFragmentInput {
+  float4 position [[position]];
+  float2 texture_position;
+  float2 local_position;
+  uint2 clip_range [[flat]];
+};
+
+vertex SurfaceTransformedVertexOutput surface_vertex_transformed(
+    uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
+    constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(SurfaceInputIndex_ViewportSize)]],
+    constant Size_DevicePixels *texture_size
+    [[buffer(SurfaceInputIndex_TextureSize)]],
+    constant SpatialState *spatial_states [[buffer(6)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  SurfaceBounds surface = surfaces[surface_id];
+  SpatialState spatial = spatial_states[surface.spatial_id - 1];
+  float4 device_position =
+      to_device_position(unit_vertex, surface.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
+                                                 surface.content_mask.bounds);
+  // We are going to copy the whole texture, so the texture position corresponds
+  // to the current vertex of the unit triangle.
+  float2 texture_position = unit_vertex;
+  device_position = transform_device_position(device_position, spatial.matrix, viewport_size);
+  return SurfaceTransformedVertexOutput{
+      device_position,
+      texture_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w},
+      float2(surface.bounds.origin.x, surface.bounds.origin.y) + unit_vertex * float2(surface.bounds.size.width, surface.bounds.size.height),
+      uint2(spatial.clip_start, spatial.clip_count)};
+}
+
+fragment float4 surface_fragment_transformed(SurfaceTransformedFragmentInput input [[stage_in]],
+                                 texture2d<float> y_texture
+                                 [[texture(SurfaceInputIndex_YTexture)]],
+                                 texture2d<float> cb_cr_texture
+                                 [[texture(SurfaceInputIndex_CbCrTexture)]],
+    constant TransformedClip *clips [[buffer(7)]]) {
+  clip_ancestors(input.position.xy, input.clip_range, clips);
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),

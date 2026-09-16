@@ -217,6 +217,7 @@ fn solid_quad(
     color: Hsla,
 ) -> Quad {
     Quad {
+        spatial_id: crate::SpatialId::IDENTITY,
         order: 0,
         border_style: BorderStyle::Solid,
         bounds,
