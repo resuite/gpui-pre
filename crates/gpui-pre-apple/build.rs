@@ -1,4 +1,4 @@
-// Modified for gpui-pre (snapshot of zed@6916400): the gpui sources it reads are vendored under `vendor/gpui`.
+// Modified for gpui-pre (snapshot of zed@6916400): shader bindings are generated from the sibling gpui-pre source tree.
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
@@ -101,7 +101,7 @@ mod macos_build {
     /// build-script runtime against this crate's manifest dir, so no checkout
     /// path is baked into a compiled artifact (which corgi rejects).
     fn find_gpui_crate_dir() -> PathBuf {
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("vendor/gpui")
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../gpui-pre")
     }
 
     /// To enable runtime compilation, we need to "stitch" the shaders file with the generated header
