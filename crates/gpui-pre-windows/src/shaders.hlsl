@@ -1405,6 +1405,9 @@ float4 quad_transformed_fragment(QuadTransformedFragmentInput input): SV_Target 
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
         return float4(1.0, 0.0, 1.0, 1.0);
     }
+    // DIAGNOSTIC ONLY: solid red so any rasterized pixel is unmistakable.
+    // Revert after diagnosis.
+    return float4(1.0, 0.0, 0.0, 1.0);
     Quad quad = quads[input.quad_id];
     return quad_shade_impl(quad, input.local_position, input.border_color,
         input.background_solid, input.background_color0, input.background_color1);

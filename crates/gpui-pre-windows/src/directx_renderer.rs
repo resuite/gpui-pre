@@ -374,6 +374,40 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        // DIAGNOSTIC ONLY: dump the first frame that carries transform state,
+        // so we can tell CPU-side upload bugs from GPU-side math bugs.
+        // Revert after diagnosis.
+        if !scene.spatial_states.is_empty() {
+            static DIAG_DUMP: std::sync::Once = std::sync::Once::new();
+            DIAG_DUMP.call_once(|| {
+                eprintln!(
+                    "[gpui-d3d11-diag] states={} clips={} quads={} shadows={} underlines={} mono={} subpixel={} poly={}",
+                    scene.spatial_states.len(),
+                    scene.transform_clips.len(),
+                    scene.quads.len(),
+                    scene.shadows.len(),
+                    scene.underlines.len(),
+                    scene.monochrome_sprites.len(),
+                    scene.subpixel_sprites.len(),
+                    scene.polychrome_sprites.len(),
+                );
+                for (i, state) in scene.spatial_states.iter().enumerate() {
+                    eprintln!(
+                        "[gpui-d3d11-diag] state[{i}] rs={:?} t={:?} clip_start={} clip_count={}",
+                        state.matrix.rotation_scale,
+                        state.matrix.translation,
+                        state.clip_start,
+                        state.clip_count,
+                    );
+                }
+                for (i, quad) in scene.quads.iter().enumerate().take(8) {
+                    eprintln!(
+                        "[gpui-d3d11-diag] quad[{i}] spatial_id={} bounds={:?}",
+                        quad.spatial_id.0, quad.bounds,
+                    );
+                }
+            });
+        }
         self.render(scene, background_appearance)?;
         self.present()
     }
