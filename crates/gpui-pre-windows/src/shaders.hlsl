@@ -141,9 +141,9 @@ float4 transform_device_position(float4 position, SpatialState state) {
 bool inside_ancestor_clips(float2 position, uint clip_start, uint clip_count) {
     for (uint i = 0u; i < clip_count; i++) {
         TransformedClip clip = transform_clips[clip_start + i];
-        float2 point = apply_inverse_clip(position, clip);
-        if (any(point < clip.bounds_origin)
-            || any(point > clip.bounds_origin + clip.bounds_size)) {
+        float2 clip_point = apply_inverse_clip(position, clip);
+        if (any(clip_point < clip.bounds_origin)
+            || any(clip_point > clip.bounds_origin + clip.bounds_size)) {
             return false;
         }
     }
