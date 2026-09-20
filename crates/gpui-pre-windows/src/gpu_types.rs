@@ -6,7 +6,7 @@
 
 use gpui::{
     AtlasTile, Background, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, PaddedBool32,
-    ScaledPixels, SpatialId,
+    ScaledPixels,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -202,9 +202,3 @@ const _: [(); 112] = [(); std::mem::size_of::<GpuMonochromeSprite>()];
 const _: [(); 96] = [(); std::mem::size_of::<GpuPolychromeSprite>()];
 const _: [(); 32] = [(); std::mem::size_of::<GpuSpatialState>()];
 const _: [(); 40] = [(); std::mem::size_of::<GpuTransformedClip>()];
-
-/// One-based spatial reference. Identity stays zero so ordinary batches skip
-/// the spatial lookup entirely.
-pub fn gpu_spatial_id(id: SpatialId) -> u32 {
-    id.0
-}

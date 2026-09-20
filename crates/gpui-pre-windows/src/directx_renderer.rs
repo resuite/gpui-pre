@@ -738,12 +738,13 @@ impl DirectXRenderer {
         &[Option<ID3D11ShaderResourceView>],
         &[Option<ID3D11ShaderResourceView>],
     )> {
-        match (
-            self.spatial.states_view.as_ref(),
-            self.spatial.clips_view.as_ref(),
-        ) {
-            (Some(states), Some(clips)) => Some((slice::from_ref(states), slice::from_ref(clips))),
-            _ => None,
+        if self.spatial.states_view.is_some() && self.spatial.clips_view.is_some() {
+            Some((
+                slice::from_ref(&self.spatial.states_view),
+                slice::from_ref(&self.spatial.clips_view),
+            ))
+        } else {
+            None
         }
     }
 
@@ -2084,8 +2085,10 @@ fn apply_scaled_matrix(
     matrix: &TransformationMatrix,
     point: Point<ScaledPixels>,
 ) -> Point<ScaledPixels> {
-    let input = point.map(|value| Pixels(value.0));
-    matrix.apply(input).map(|value| ScaledPixels(value.0))
+    let input = point.map(|value| Pixels::from(value.0));
+    matrix
+        .apply(input)
+        .map(|value| ScaledPixels(f32::from(value)))
 }
 
 #[inline]
