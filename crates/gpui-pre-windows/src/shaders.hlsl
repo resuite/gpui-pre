@@ -1405,13 +1405,10 @@ float4 quad_transformed_fragment(QuadTransformedFragmentInput input): SV_Target 
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
         return float4(1.0, 0.0, 1.0, 1.0);
     }
-    // DIAGNOSTIC ONLY: R = solid alpha (expect 1), G = quad id check.
-    // Yellow = both fine. Green = alpha broken. Red = id broken.
-    // Black = both broken. Revert after diagnosis.
-    return float4(input.background_solid.a, input.quad_id == 1u ? 1.0 : 0.0, 0.0, 1.0);
+    // DIAGNOSTIC ONLY: green if the reloaded element is solid (tag 0),
+    // red if the fragment-side reload returns garbage. Revert after.
     Quad quad = quads[input.quad_id];
-    return quad_shade_impl(quad, input.local_position, input.border_color,
-        input.background_solid, input.background_color0, input.background_color1);
+    return quad.background.tag == 0u ? float4(0.0, 1.0, 0.0, 1.0) : float4(1.0, 0.0, 0.0, 1.0);
 }
 
 struct ShadowTransformedVertexOutput {
