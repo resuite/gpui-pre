@@ -1405,11 +1405,11 @@ float4 quad_transformed_fragment(QuadTransformedFragmentInput input): SV_Target 
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
         return float4(1.0, 0.0, 1.0, 1.0);
     }
-    // DIAGNOSTIC ONLY: paint the raw solid-color channel with full alpha.
-    // Blue rounded box = local coords fine, color channels broken.
-    // Invisible = local coords broken (SDF kills every pixel).
+    // DIAGNOSTIC ONLY: visualize the local coordinates as color.
+    // Smooth tint across the box = coords arrive fine (quad reload guilty).
+    // Flat black = coords arrive broken (the vanish culprit).
     // Revert after diagnosis.
-    return float4(input.background_solid.rgb, 1.0);
+    return float4(input.local_position / 1280.0, 0.0, 1.0);
     Quad quad = quads[input.quad_id];
     return quad_shade_impl(quad, input.local_position, input.border_color,
         input.background_solid, input.background_color0, input.background_color1);
