@@ -50,6 +50,10 @@ path = "src/gpui_windows.rs"
 name = "gpu_types"
 path = "tests/gpu_types.rs"
 
+[[test]]
+name = "shader_interfaces"
+path = "tests/shader_interfaces.rs"
+
 [dependencies.gpui]
 version = "=0.3.4"
 default-features = false

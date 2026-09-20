@@ -1365,8 +1365,11 @@ struct QuadTransformedVertexOutput {
     nointerpolation float4 bg_clip: TEXCOORD9;
 };
 
+// Keep these inputs in the same order as the vertex outputs, including the
+// unused clip distance: D3D11 links register locations, not just semantic names.
 struct QuadTransformedFragmentInput {
     float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
     float2 local_position: TEXCOORD0;
     nointerpolation float4 border_color: TEXCOORD1;
     nointerpolation float4 background_solid: TEXCOORD2;
@@ -1469,6 +1472,7 @@ struct ShadowTransformedFragmentInput {
     nointerpolation uint shadow_id: TEXCOORD0;
     float4 position: SV_Position;
     nointerpolation float4 color: COLOR;
+    float4 clip_distance: SV_ClipDistance;
     float2 local_position: TEXCOORD1;
     nointerpolation uint2 clip_range: TEXCOORD2;
 };
@@ -1524,6 +1528,7 @@ struct UnderlineTransformedFragmentInput {
     nointerpolation uint underline_id: TEXCOORD0;
     float4 position: SV_Position;
     nointerpolation float4 color: COLOR;
+    float4 clip_distance: SV_ClipDistance;
     float2 local_position: TEXCOORD1;
     nointerpolation uint2 clip_range: TEXCOORD2;
 };
@@ -1615,6 +1620,7 @@ struct PolychromeSpriteTransformedFragmentInput {
     nointerpolation uint sprite_id: TEXCOORD0;
     float4 position: SV_Position;
     float2 tile_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
     float2 local_position: TEXCOORD1;
     nointerpolation uint2 clip_range: TEXCOORD2;
 };
