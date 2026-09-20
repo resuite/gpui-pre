@@ -722,7 +722,6 @@ float4 quad_shade_impl(Quad quad, float2 local_position, float4 border_color,
 
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
-        float4 border_color = border_color;
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
