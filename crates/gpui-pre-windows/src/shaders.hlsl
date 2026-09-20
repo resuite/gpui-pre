@@ -1400,8 +1400,10 @@ QuadTransformedVertexOutput quad_transformed_vertex(uint vertex_id: SV_VertexID,
 }
 
 float4 quad_transformed_fragment(QuadTransformedFragmentInput input): SV_Target {
+    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
+    // so a clip-data failure shows up instead of vanishing. Revert after.
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        discard;
+        return float4(1.0, 0.0, 1.0, 1.0);
     }
     Quad quad = quads[input.quad_id];
     return quad_shade_impl(quad, input.local_position, input.border_color,
@@ -1454,8 +1456,10 @@ ShadowTransformedVertexOutput shadow_transformed_vertex(uint vertex_id: SV_Verte
 }
 
 float4 shadow_transformed_fragment(ShadowTransformedFragmentInput input): SV_TARGET {
+    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
+    // so a clip-data failure shows up instead of vanishing. Revert after.
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        discard;
+        return float4(1.0, 0.0, 1.0, 1.0);
     }
     Shadow shadow = shadows[input.shadow_id];
     return shadow_shade_impl(shadow, input.local_position, input.color);
@@ -1497,8 +1501,10 @@ UnderlineTransformedVertexOutput underline_transformed_vertex(uint vertex_id: SV
 }
 
 float4 underline_transformed_fragment(UnderlineTransformedFragmentInput input): SV_Target {
+    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
+    // so a clip-data failure shows up instead of vanishing. Revert after.
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        discard;
+        return float4(1.0, 0.0, 1.0, 1.0);
     }
     Underline underline = underlines[input.underline_id];
     return underline_shade_impl(underline, input.local_position, input.color);
@@ -1540,8 +1546,10 @@ MonochromeSpriteTransformedVertexOutput monochrome_sprite_transformed_vertex(uin
 }
 
 float4 monochrome_sprite_transformed_fragment(MonochromeSpriteTransformedFragmentInput input): SV_Target {
+    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
+    // so a clip-data failure shows up instead of vanishing. Revert after.
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        discard;
+        return float4(1.0, 0.0, 1.0, 1.0);
     }
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
@@ -1584,8 +1592,10 @@ PolychromeSpriteTransformedVertexOutput polychrome_sprite_transformed_vertex(uin
 }
 
 float4 polychrome_sprite_transformed_fragment(PolychromeSpriteTransformedFragmentInput input): SV_Target {
+    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
+    // so a clip-data failure shows up instead of vanishing. Revert after.
     if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        discard;
+        return float4(1.0, 0.0, 1.0, 1.0);
     }
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
     float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
