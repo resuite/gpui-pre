@@ -1349,26 +1349,34 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 */
 
 struct QuadTransformedVertexOutput {
-    nointerpolation uint quad_id: TEXCOORD0;
     float4 position: SV_Position;
-    nointerpolation float4 border_color: COLOR0;
-    nointerpolation float4 background_solid: COLOR1;
-    nointerpolation float4 background_color0: COLOR2;
-    nointerpolation float4 background_color1: COLOR3;
     float4 clip_distance: SV_ClipDistance;
-    float2 local_position: TEXCOORD1;
-    nointerpolation uint2 clip_range: TEXCOORD2;
+    float2 local_position: TEXCOORD0;
+    nointerpolation float4 border_color: TEXCOORD1;
+    nointerpolation float4 background_solid: TEXCOORD2;
+    nointerpolation float4 background_color0: TEXCOORD3;
+    nointerpolation float4 background_color1: TEXCOORD4;
+    // Style data as plain floats: no buffer reload and no integer varyings
+    // in the fragment stage.
+    nointerpolation float4 quad_bounds: TEXCOORD5;
+    nointerpolation float4 corner_radii: TEXCOORD6;
+    nointerpolation float4 border_widths: TEXCOORD7;
+    nointerpolation float4 bg_params: TEXCOORD8;
+    nointerpolation float4 bg_clip: TEXCOORD9;
 };
 
 struct QuadTransformedFragmentInput {
-    nointerpolation uint quad_id: TEXCOORD0;
     float4 position: SV_Position;
-    nointerpolation float4 border_color: COLOR0;
-    nointerpolation float4 background_solid: COLOR1;
-    nointerpolation float4 background_color0: COLOR2;
-    nointerpolation float4 background_color1: COLOR3;
-    float2 local_position: TEXCOORD1;
-    nointerpolation uint2 clip_range: TEXCOORD2;
+    float2 local_position: TEXCOORD0;
+    nointerpolation float4 border_color: TEXCOORD1;
+    nointerpolation float4 background_solid: TEXCOORD2;
+    nointerpolation float4 background_color0: TEXCOORD3;
+    nointerpolation float4 background_color1: TEXCOORD4;
+    nointerpolation float4 quad_bounds: TEXCOORD5;
+    nointerpolation float4 corner_radii: TEXCOORD6;
+    nointerpolation float4 border_widths: TEXCOORD7;
+    nointerpolation float4 bg_params: TEXCOORD8;
+    nointerpolation float4 bg_clip: TEXCOORD9;
 };
 
 QuadTransformedVertexOutput quad_transformed_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
@@ -1389,26 +1397,62 @@ QuadTransformedVertexOutput quad_transformed_vertex(uint vertex_id: SV_VertexID,
     QuadTransformedVertexOutput output;
     output.position = device_position;
     output.border_color = hsla_to_rgba(quad.border_color);
-    output.quad_id = quad_id;
     output.background_solid = gradient.solid;
     output.background_color0 = gradient.color0;
     output.background_color1 = gradient.color1;
     output.clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
     output.local_position = quad.bounds.origin + unit_vertex * quad.bounds.size;
-    output.clip_range = uint2(spatial.clip_start, spatial.clip_count);
+    output.quad_bounds = float4(quad.bounds.origin, quad.bounds.size);
+    output.corner_radii = float4(
+        quad.corner_radii.top_left, quad.corner_radii.top_right,
+        quad.corner_radii.bottom_right, quad.corner_radii.bottom_left);
+    output.border_widths = float4(
+        quad.border_widths.top, quad.border_widths.right,
+        quad.border_widths.bottom, quad.border_widths.left);
+    output.bg_params = float4(
+        float(quad.background.tag), float(quad.background.color_space),
+        quad.background.gradient_angle_or_pattern_height, float(quad.border_style));
+    output.bg_clip = float4(
+        quad.background.colors[0].percentage, quad.background.colors[1].percentage,
+        float(spatial.clip_start), float(spatial.clip_count));
     return output;
 }
 
 float4 quad_transformed_fragment(QuadTransformedFragmentInput input): SV_Target {
-    // DIAGNOSTIC ONLY: paint rejected pixels magenta instead of discarding,
-    // so a clip-data failure shows up instead of vanishing. Revert after.
-    if (!inside_ancestor_clips(input.position.xy, input.clip_range.x, input.clip_range.y)) {
-        return float4(1.0, 0.0, 1.0, 1.0);
+    uint clip_start = (uint)input.bg_clip.z;
+    uint clip_count = (uint)input.bg_clip.w;
+    if (!inside_ancestor_clips(input.position.xy, clip_start, clip_count)) {
+        discard;
     }
-    // DIAGNOSTIC ONLY: green if the reloaded element is solid (tag 0),
-    // red if the fragment-side reload returns garbage. Revert after.
-    Quad quad = quads[input.quad_id];
-    return quad.background.tag == 0u ? float4(0.0, 1.0, 0.0, 1.0) : float4(1.0, 0.0, 0.0, 1.0);
+    // Rebuild the element from float varyings: no buffer reload and no
+    // integer varyings in this stage. Hsla fields below are unread (rgba
+    // arrives separately); percentages drive the gradient dispatch.
+    Quad quad;
+    quad.order = 0;
+    quad.border_style = (uint)input.bg_params.w;
+    quad.bounds.origin = input.quad_bounds.xy;
+    quad.bounds.size = input.quad_bounds.zw;
+    quad.content_mask = quad.bounds;
+    quad.background.tag = (uint)input.bg_params.x;
+    quad.background.color_space = (uint)input.bg_params.y;
+    quad.background.solid = Hsla(0.0, 0.0, 0.0, 0.0);
+    quad.background.gradient_angle_or_pattern_height = input.bg_params.z;
+    quad.background.colors[0].color = Hsla(0.0, 0.0, 0.0, 0.0);
+    quad.background.colors[0].percentage = input.bg_clip.x;
+    quad.background.colors[1].color = Hsla(0.0, 0.0, 0.0, 0.0);
+    quad.background.colors[1].percentage = input.bg_clip.y;
+    quad.background.pad = 0;
+    quad.border_color = Hsla(0.0, 0.0, 0.0, 0.0);
+    quad.corner_radii.top_left = input.corner_radii.x;
+    quad.corner_radii.top_right = input.corner_radii.y;
+    quad.corner_radii.bottom_right = input.corner_radii.z;
+    quad.corner_radii.bottom_left = input.corner_radii.w;
+    quad.border_widths.top = input.border_widths.x;
+    quad.border_widths.right = input.border_widths.y;
+    quad.border_widths.bottom = input.border_widths.z;
+    quad.border_widths.left = input.border_widths.w;
+    return quad_shade_impl(quad, input.local_position, input.border_color,
+        input.background_solid, input.background_color0, input.background_color1);
 }
 
 struct ShadowTransformedVertexOutput {
