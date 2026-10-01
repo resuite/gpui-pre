@@ -8,7 +8,7 @@
   - `crates/gpui-pre/src/scene.rs`, `crates/gpui-pre/src/bounds_tree.rs`
   - 2D paint transforms across `crates/gpui-pre`, `crates/gpui-pre-apple`, `crates/gpui-pre-wgpu`, and `crates/gpui-pre-windows`
 
-The macOS patch touches only `src/platform.rs`. It adds an embedded macOS event-loop mode so GPUI can run inside a host process (Retend's Node/napi binding) instead of taking over the process with a blocking `CFRunLoopRun()`.
+The macOS patch touches only `src/platform.rs`. It adds an embedded macOS event-loop mode so GPUI can run inside a host process (Retend's Node/napi binding) without permanently taking over the process. Each host-driven pump briefly re-enters `NSApplication.run()` and stops at the run loop's before-waiting boundary, preserving AppKit's native fullscreen and event-tracking behavior while still returning control to Node.
 
 The original `gpui-pre` performance patch has two parts:
 

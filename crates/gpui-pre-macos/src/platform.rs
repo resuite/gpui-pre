@@ -20,11 +20,15 @@ use cocoa::{
     },
 };
 use core_foundation::{
-    base::{CFRelease, CFType, CFTypeRef, OSStatus, TCFType},
+    base::{Boolean, CFRelease, CFType, CFTypeRef, OSStatus, TCFType, kCFAllocatorDefault},
     boolean::CFBoolean,
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
+    runloop::{
+        CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CFRunLoopObserverContext,
+        CFRunLoopObserverCreate, CFRunLoopObserverRef, CFRunLoopRun, kCFRunLoopBeforeWaiting,
+        kCFRunLoopCommonModes,
+    },
     string::{CFString, CFStringRef},
 };
 use ctor::ctor;
@@ -591,26 +595,43 @@ impl MacPlatform {
     }
 }
 
-unsafe fn pump_app_nonblocking() {
+extern "C" fn stop_embedded_app_before_waiting(
+    _: CFRunLoopObserverRef,
+    _: CFRunLoopActivity,
+    _: *mut c_void,
+) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
-        let distant_past: id = msg_send![class!(NSDate), distantPast];
-        let mode = kCFRunLoopDefaultMode as id;
+        stop_app_immediately_with_app(app);
+    }
+}
 
-        for _ in 0..256 {
-            let event: id = msg_send![app,
-                nextEventMatchingMask: NSUInteger::MAX
-                untilDate: distant_past
-                inMode: mode
-                dequeue: YES
-            ];
-            if event == nil {
-                break;
-            }
-            let _: () = msg_send![app, sendEvent: event];
-        }
-        let _: () = msg_send![app, updateWindows];
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
+unsafe fn pump_app_nonblocking() {
+    unsafe {
+        // Re-enter NSApplication's real event loop so AppKit remains in charge of
+        // native behaviors such as fullscreen menu-bar and window-chrome reveal.
+        // A one-shot common-mode observer stops the loop immediately before it
+        // would block waiting for more work, returning control to the host loop.
+        let mut context = CFRunLoopObserverContext {
+            version: 0,
+            info: ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+        let observer = CFRunLoopObserver::wrap_under_create_rule(CFRunLoopObserverCreate(
+            kCFAllocatorDefault,
+            kCFRunLoopBeforeWaiting,
+            false as Boolean,
+            0,
+            stop_embedded_app_before_waiting,
+            &mut context,
+        ));
+        let run_loop = CFRunLoop::get_current();
+        run_loop.add_observer(&observer, kCFRunLoopCommonModes);
+
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        app.run();
     }
 }
 
@@ -635,11 +656,17 @@ unsafe fn post_wake_event() {
     }
 }
 
+unsafe fn stop_app_immediately_with_app(app: id) {
+    unsafe {
+        app.stop_(nil);
+        post_wake_event();
+    }
+}
+
 unsafe fn stop_app_immediately() {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
-        app.stop_(nil);
-        post_wake_event();
+        stop_app_immediately_with_app(app);
     }
 }
 

@@ -1,7 +1,6 @@
-diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/platform.rs
---- /tmp/gpui-pre-macos-upstream/src/platform.rs	2006-07-24 02:21:28
-+++ vendor/gpui-pre-macos/src/platform.rs	2026-09-09 08:08:44
-@@ -9,12 +9,14 @@
+--- /tmp/gpui-pre-macos-upstream/src/platform.rs
++++ vendor/gpui-pre-macos/src/platform.rs
+@@ -9,20 +9,26 @@
      appkit::{
          NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
          NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular, NSControl as _,
@@ -19,16 +18,21 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      },
  };
  use core_foundation::{
-@@ -22,7 +24,7 @@
+-    base::{CFRelease, CFType, CFTypeRef, OSStatus, TCFType},
++    base::{Boolean, CFRelease, CFType, CFTypeRef, OSStatus, TCFType, kCFAllocatorDefault},
      boolean::CFBoolean,
      data::CFData,
      dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
 -    runloop::CFRunLoopRun,
-+    runloop::{CFRunLoopRun, CFRunLoopRunInMode, kCFRunLoopDefaultMode},
++    runloop::{
++        CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CFRunLoopObserverContext,
++        CFRunLoopObserverCreate, CFRunLoopObserverRef, CFRunLoopRun, kCFRunLoopBeforeWaiting,
++        kCFRunLoopCommonModes,
++    },
      string::{CFString, CFStringRef},
  };
  use ctor::ctor;
-@@ -58,7 +60,7 @@
+@@ -58,7 +64,7 @@
      slice, str,
      sync::{
          Arc, OnceLock,
@@ -37,7 +41,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      },
  };
  
-@@ -68,6 +70,7 @@
+@@ -68,6 +74,7 @@
  const MAC_PLATFORM_IVAR: &str = "platform";
  static mut APP_CLASS: *const Class = ptr::null();
  static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
@@ -45,7 +49,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
  
  #[ctor(unsafe)]
  unsafe fn build_classes() {
-@@ -166,12 +169,27 @@
+@@ -166,12 +173,27 @@
  
  pub struct MacPlatform(Mutex<MacPlatformState>, MainThreadMarker);
  
@@ -73,7 +77,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      general_pasteboard: Pasteboard,
      find_pasteboard: Pasteboard,
      reopen: Option<Box<dyn FnMut()>>,
-@@ -217,6 +235,7 @@
+@@ -217,6 +239,7 @@
  
          let state = Mutex::new(MacPlatformState {
              headless,
@@ -81,10 +85,12 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
              text_system,
              background_executor: BackgroundExecutor::new(dispatcher.clone()),
              foreground_executor: ForegroundExecutor::new(dispatcher),
-@@ -244,6 +263,100 @@
+@@ -242,6 +265,100 @@
+             system_notifications: crate::system_notifications::SystemNotificationState::new(),
+         });
          Self(state, marker)
-     }
- 
++    }
++
 +    /// Creates a platform whose AppKit loop is driven by a foreign main loop.
 +    pub fn new_embedded() -> Self {
 +        let platform = Self::new(false);
@@ -177,35 +183,50 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
 +            let _: () = msg_send![workspace_center, removeObserver: delegate];
 +            (*delegate).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
 +        }
-+    }
-+
+     }
+ 
      unsafe fn create_menu_bar(
-         &self,
-         menus: &Vec<Menu>,
-@@ -478,6 +591,73 @@
+@@ -478,6 +595,96 @@
      }
  }
  
-+unsafe fn pump_app_nonblocking() {
++extern "C" fn stop_embedded_app_before_waiting(
++    _: CFRunLoopObserverRef,
++    _: CFRunLoopActivity,
++    _: *mut c_void,
++) {
 +    unsafe {
 +        let app: id = msg_send![APP_CLASS, sharedApplication];
-+        let distant_past: id = msg_send![class!(NSDate), distantPast];
-+        let mode = kCFRunLoopDefaultMode as id;
++        stop_app_immediately_with_app(app);
++    }
++}
 +
-+        for _ in 0..256 {
-+            let event: id = msg_send![app,
-+                nextEventMatchingMask: NSUInteger::MAX
-+                untilDate: distant_past
-+                inMode: mode
-+                dequeue: YES
-+            ];
-+            if event == nil {
-+                break;
-+            }
-+            let _: () = msg_send![app, sendEvent: event];
-+        }
-+        let _: () = msg_send![app, updateWindows];
-+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1);
++unsafe fn pump_app_nonblocking() {
++    unsafe {
++        // Re-enter NSApplication's real event loop so AppKit remains in charge of
++        // native behaviors such as fullscreen menu-bar and window-chrome reveal.
++        // A one-shot common-mode observer stops the loop immediately before it
++        // would block waiting for more work, returning control to the host loop.
++        let mut context = CFRunLoopObserverContext {
++            version: 0,
++            info: ptr::null_mut(),
++            retain: None,
++            release: None,
++            copyDescription: None,
++        };
++        let observer = CFRunLoopObserver::wrap_under_create_rule(CFRunLoopObserverCreate(
++            kCFAllocatorDefault,
++            kCFRunLoopBeforeWaiting,
++            false as Boolean,
++            0,
++            stop_embedded_app_before_waiting,
++            &mut context,
++        ));
++        let run_loop = CFRunLoop::get_current();
++        run_loop.add_observer(&observer, kCFRunLoopCommonModes);
++
++        let app: id = msg_send![APP_CLASS, sharedApplication];
++        app.run();
 +    }
 +}
 +
@@ -230,11 +251,17 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
 +    }
 +}
 +
++unsafe fn stop_app_immediately_with_app(app: id) {
++    unsafe {
++        app.stop_(nil);
++        post_wake_event();
++    }
++}
++
 +unsafe fn stop_app_immediately() {
 +    unsafe {
 +        let app: id = msg_send![APP_CLASS, sharedApplication];
-+        app.stop_(nil);
-+        post_wake_event();
++        stop_app_immediately_with_app(app);
 +    }
 +}
 +
@@ -256,7 +283,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
  impl Platform for MacPlatform {
      fn background_executor(&self) -> BackgroundExecutor {
          self.0.lock().background_executor.clone()
-@@ -493,6 +673,15 @@
+@@ -493,6 +700,15 @@
  
      fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
          let mut state = self.0.lock();
@@ -272,16 +299,16 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          if state.headless {
              drop(state);
              on_finish_launching();
-@@ -506,17 +695,17 @@
+@@ -506,17 +722,17 @@
              let app: id = msg_send![APP_CLASS, sharedApplication];
              let app_delegate: id = msg_send![APP_DELEGATE_CLASS, new];
              app.setDelegate_(app_delegate);
-+            self.register_with_appkit(app, app_delegate);
- 
+-
 -            let self_ptr = self as *const Self as *const c_void;
 -            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
 -            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
--
++            self.register_with_appkit(app, app_delegate);
+ 
              let pool = NSAutoreleasePool::new(nil);
              app.run();
              pool.drain();
@@ -296,7 +323,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          }
      }
  
-@@ -1257,11 +1446,10 @@
+@@ -1257,11 +1473,10 @@
      PathBuf::from(path)
  }
  
@@ -310,7 +337,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      }
  }
  
-@@ -1305,18 +1493,26 @@
+@@ -1305,17 +1520,25 @@
          ];
  
          let observer = this as *mut Object as id;
@@ -333,14 +360,13 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          };
          if let Some(callback) = callback {
              callback();
-         }
++        }
 +        if embedded {
 +            stop_app_immediately();
-+        }
+         }
      }
  }
- 
-@@ -1336,7 +1532,9 @@
+@@ -1336,7 +1559,9 @@
  
  extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
      if !has_open_windows {
@@ -351,7 +377,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.reopen.take() {
              drop(lock);
-@@ -1347,8 +1545,13 @@
+@@ -1347,8 +1572,13 @@
  }
  
  extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
@@ -366,7 +392,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      if let Some(mut callback) = lock.quit.take() {
          drop(lock);
          callback();
-@@ -1357,7 +1560,9 @@
+@@ -1357,7 +1587,9 @@
  }
  
  extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
@@ -377,7 +403,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      let mut lock = platform.0.lock();
      let keyboard_layout = MacKeyboardLayout::new();
      lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
-@@ -1376,14 +1581,18 @@
+@@ -1376,14 +1608,18 @@
      // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
      // as NSNotificationCenter delivers this notification synchronously and it may fire while
      // the App is already borrowed (same pattern as quit() above).
@@ -398,7 +424,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.on_thermal_state_change.take() {
              drop(lock);
-@@ -1399,7 +1608,9 @@
+@@ -1399,7 +1635,9 @@
  
  extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
      // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
@@ -409,7 +435,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      let platform_ptr = platform as *const MacPlatform as *mut c_void;
      // SAFETY: platform lives for the process lifetime while callbacks are registered.
      unsafe {
-@@ -1407,8 +1618,9 @@
+@@ -1407,8 +1645,9 @@
      }
  
      extern "C" fn on_system_wake(context: *mut c_void) {
@@ -421,7 +447,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.on_system_wake.take() {
              drop(lock);
-@@ -1433,7 +1645,9 @@
+@@ -1433,7 +1672,9 @@
              })
              .collect::<Vec<_>>()
      };
@@ -432,7 +458,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
      let mut lock = platform.0.lock();
      if let Some(mut callback) = lock.open_urls.take() {
          drop(lock);
-@@ -1444,7 +1658,9 @@
+@@ -1444,7 +1685,9 @@
  
  extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
      unsafe {
@@ -443,7 +469,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.menu_command.take() {
              let tag: NSInteger = msg_send![item, tag];
-@@ -1462,7 +1678,9 @@
+@@ -1462,7 +1705,9 @@
  extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
      unsafe {
          let mut result = false;
@@ -454,7 +480,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.validate_menu_command.take() {
              let tag: NSInteger = msg_send![item, tag];
-@@ -1484,7 +1702,9 @@
+@@ -1484,7 +1729,9 @@
  
  extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
      unsafe {
@@ -465,7 +491,7 @@ diff -ru /tmp/gpui-pre-macos-upstream/src/platform.rs vendor/gpui-pre-macos/src/
          let mut lock = platform.0.lock();
          if let Some(mut callback) = lock.will_open_menu.take() {
              drop(lock);
-@@ -1496,7 +1716,9 @@
+@@ -1496,7 +1743,9 @@
  
  extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
      unsafe {
