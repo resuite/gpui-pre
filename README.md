@@ -8,7 +8,7 @@ This repository is not Zed and it is not Retend. It exists so Retend can depend 
 
 - `crates/gpui-pre` — `gpui-pre` 0.3.4 plus Retend's scene replay, bounds-tree, and sparse 2D spatial-transform support
 - `crates/gpui-pre-apple` — `gpui-pre-apple` 0.3.4 plus Metal support for sparse transformed primitives and clips
-- `crates/gpui-pre-macos` — `gpui-pre-macos` 0.3.4 plus an embedded NSApplication / CFRunLoop pump and native-fullscreen presentation fixes
+- `crates/gpui-pre-macos` — `gpui-pre-macos` 0.3.4 plus an embedded NSApplication / CFRunLoop pump in `src/platform.rs`
 - `crates/gpui-pre-wgpu` — `gpui-pre-wgpu` 0.3.4 plus WGPU support for sparse transformed primitives and clips
 - `crates/gpui-pre-windows` — `gpui-pre-windows` 0.3.4 plus Direct3D 11 support for sparse transformed primitives and clips
 

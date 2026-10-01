@@ -5,13 +5,10 @@
 - Zed snapshot recorded by the crates: `69164008341295ad481bb11c0334a712ca8c23e3`
 - local deltas:
   - `patches/gpui-pre-macos-embedded-runloop.patch`
-  - `patches/gpui-pre-macos-fullscreen-presentation.patch`
   - `crates/gpui-pre/src/scene.rs`, `crates/gpui-pre/src/bounds_tree.rs`
   - 2D paint transforms across `crates/gpui-pre`, `crates/gpui-pre-apple`, `crates/gpui-pre-wgpu`, and `crates/gpui-pre-windows`
 
-The embedded macOS run-loop patch touches `src/platform.rs`. It lets GPUI run inside a host process (Retend's Node/napi binding) without permanently taking over the process. Each host-driven pump briefly re-enters `NSApplication.run()` and stops at the run loop's before-waiting boundary, preserving AppKit event tracking while still returning control to Node.
-
-The macOS fullscreen-presentation patch touches `src/window.rs`. A hosted `NSApplication` can propose presentation options inherited from its executable host, so native fullscreen explicitly replaces fully hidden menu-bar/Dock flags with AppKit's auto-hide variants. This preserves the normal macOS behavior where moving to a screen edge reveals fullscreen system chrome.
+The macOS patch touches only `src/platform.rs`. It adds an embedded macOS event-loop mode so GPUI can run inside a host process (Retend's Node/napi binding) without permanently taking over the process. Each host-driven pump briefly re-enters `NSApplication.run()` and stops at the run loop's before-waiting boundary, preserving AppKit's native fullscreen and event-tracking behavior while still returning control to Node.
 
 The original `gpui-pre` performance patch has two parts:
 
@@ -27,6 +24,6 @@ The Windows implementation targets Direct3D 11 (`vs_4_1`/`ps_4_1` so 10.1-level 
 To refresh against a newer snapshot:
 
 1. Extract matching `gpui-pre`, `gpui-pre-apple`, `gpui-pre-macos`, `gpui-pre-wgpu`, and `gpui-pre-windows` crates from crates.io onto a clean branch.
-2. Re-apply the embedded macOS run-loop and fullscreen-presentation patches, then rebase the core/renderer transform and performance changes.
+2. Re-apply the embedded macOS run-loop patch and rebase the core/renderer transform and performance changes.
 3. Keep all five Cargo package versions aligned with the snapshot being replaced.
 4. Point `retend-gpui` at the new commit and bump every patched `gpui-pre*` pin together.
