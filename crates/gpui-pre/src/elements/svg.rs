@@ -61,6 +61,18 @@ impl Svg {
         self
     }
 
+    /// Set raw SVG data the caller has already prepared, identified by `key`.
+    ///
+    /// Unlike [`Svg::data`], this neither hashes nor copies the bytes, so a
+    /// caller that rebuilds the element every frame can prepare its markup
+    /// once. `key` names the bytes in GPUI's raster cache, so it must be
+    /// unique to this content and must not collide with an asset path.
+    pub fn shared_data(mut self, key: impl Into<SharedString>, data: Arc<[u8]>) -> Self {
+        self.data = Some(data);
+        self.data_path = Some(key.into());
+        self
+    }
+
     /// Transform the SVG element with the given transformation.
     /// Note that this won't effect the hitbox or layout of the element, only the rendering.
     pub fn with_transformation(mut self, transformation: Transformation) -> Self {
@@ -137,7 +149,7 @@ impl Element for Svg {
             hitbox.as_ref(),
             window,
             cx,
-            |style, window, cx| {
+            |_style, window, cx| {
                 let transformation = self
                     .transformation
                     .as_ref()
@@ -145,23 +157,25 @@ impl Element for Svg {
                         transformation.into_matrix(bounds.center(), window.scale_factor())
                     })
                     .unwrap_or_default();
+                // `Interactivity::paint` has pushed this element's own text
+                // refinements (including hover/active states) onto the text
+                // style stack, so this is the inherited color with any local
+                // override applied: CSS `currentColor` semantics. An icon
+                // without its own `text_color` follows its container.
+                let color = window.text_style().color;
 
                 if let Some((data, path)) = self.data.as_ref().zip(self.data_path.as_ref()) {
-                    if let Some(color) = style.text.color {
-                        window
-                            .paint_svg(
-                                bounds,
-                                path.clone(),
-                                Some(&**data),
-                                transformation,
-                                color,
-                                cx,
-                            )
-                            .log_err();
-                    }
-                } else if let Some((path, color)) =
-                    self.external_path.as_ref().zip(style.text.color)
-                {
+                    window
+                        .paint_svg(
+                            bounds,
+                            path.clone(),
+                            Some(&**data),
+                            transformation,
+                            color,
+                            cx,
+                        )
+                        .log_err();
+                } else if let Some(path) = self.external_path.as_ref() {
                     let Some(bytes) = window
                         .use_asset::<SvgAsset>(path, cx)
                         .and_then(|asset| asset.log_err())
@@ -179,7 +193,7 @@ impl Element for Svg {
                             cx,
                         )
                         .log_err();
-                } else if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+                } else if let Some(path) = self.path.as_ref() {
                     window
                         .paint_svg(bounds, path.clone(), None, transformation, color, cx)
                         .log_err();

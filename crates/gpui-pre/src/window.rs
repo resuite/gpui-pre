@@ -2312,6 +2312,13 @@ impl Window {
         &self.text_system
     }
 
+    /// Monochrome sprites (glyphs and SVG icons) painted in the last
+    /// rendered frame, so downstream renderers can test paint results.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_monochrome_sprites(&self) -> Vec<crate::MonochromeSprite> {
+        self.rendered_frame.scene.monochrome_sprites.clone()
+    }
+
     /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
     pub fn text_style(&self) -> TextStyle {
         let mut style = TextStyle::default();
