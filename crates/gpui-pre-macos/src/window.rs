@@ -11,10 +11,10 @@ use block2::RcBlock;
 use cocoa::{
     appkit::{
         NSApplication, NSBackingStoreBuffered, NSColor, NSEvent, NSEventModifierFlags, NSEventType,
-        NSFilenamesPboardType, NSPasteboard, NSRequestUserAttentionType, NSScreen, NSView,
-        NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial, NSVisualEffectState,
-        NSVisualEffectView, NSWindow, NSWindowCollectionBehavior, NSWindowOcclusionState,
-        NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+        NSFilenamesPboardType, NSPasteboard, NSPasteboardTypeString, NSRequestUserAttentionType,
+        NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowCollectionBehavior,
+        NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
     },
     base::{id, nil},
     foundation::{
@@ -76,6 +76,15 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const TEXT_SERVICES_STATE_IVAR: &str = "textServicesState";
+
+#[derive(Default)]
+struct TextServicesState {
+    enabled: bool,
+    editable: bool,
+    // Only the selection is retained, to reject stale asynchronous service edits.
+    selection: Option<(Range<usize>, String)>,
+}
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -135,7 +144,20 @@ unsafe fn build_classes() {
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+            decl.add_ivar::<*mut c_void>(TEXT_SERVICES_STATE_IVAR);
             decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
+            decl.add_method(
+                sel!(validRequestorForSendType:returnType:),
+                valid_text_service_requestor as extern "C" fn(&Object, Sel, id, id) -> id,
+            );
+            decl.add_method(
+                sel!(writeSelectionToPasteboard:types:),
+                write_text_service_selection as extern "C" fn(&Object, Sel, id, id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(readSelectionFromPasteboard:),
+                read_text_service_selection as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
 
             decl.add_method(
                 sel!(performKeyEquivalent:),
@@ -2275,6 +2297,10 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
 
 extern "C" fn dealloc_view(this: &Object, _: Sel) {
     unsafe {
+        let state: *mut c_void = *this.get_ivar(TEXT_SERVICES_STATE_IVAR);
+        if !state.is_null() {
+            drop(Box::from_raw(state as *mut TextServicesState));
+        }
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
@@ -3005,6 +3031,144 @@ extern "C" fn step(view: *mut c_void) {
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }
+}
+
+/// Enable AppKit's selected-text services for a custom GPUI text editor.
+///
+/// The view's existing NSTextInputClient handler remains the source of truth.
+/// Only the current selection is retained to reject a stale service response.
+///
+/// # Safety
+/// `view` must be a live GPUIView on the macOS main thread.
+pub unsafe fn configure_text_services(view: *mut c_void, enabled: bool, editable: bool) {
+    let view = unsafe { &mut *(view as *mut Object) };
+    unsafe {
+        let raw: *mut c_void = *view.get_ivar(TEXT_SERVICES_STATE_IVAR);
+        let state = if raw.is_null() {
+            let state = Box::into_raw(Box::new(TextServicesState::default()));
+            view.set_ivar(TEXT_SERVICES_STATE_IVAR, state as *mut c_void);
+            &mut *state
+        } else {
+            &mut *(raw as *mut TextServicesState)
+        };
+        state.enabled = enabled;
+        state.editable = editable;
+        state.selection = None;
+    }
+}
+
+fn text_services_state(view: &Object) -> Option<&mut TextServicesState> {
+    // AppKit uses GPUIView exclusively on the main thread.
+    unsafe {
+        let raw: *mut c_void = *view.get_ivar(TEXT_SERVICES_STATE_IVAR);
+        (!raw.is_null()).then(|| &mut *(raw as *mut TextServicesState))
+    }
+}
+
+extern "C" fn valid_text_service_requestor(
+    this: &Object,
+    _: Sel,
+    send_type: id,
+    return_type: id,
+) -> id {
+    let Some(state) = text_services_state(this) else {
+        return nil;
+    };
+    if !state.enabled || send_type.is_null() {
+        return nil;
+    }
+    unsafe {
+        let plain: BOOL = msg_send![send_type, isEqualToString: NSPasteboardTypeString];
+        if plain == NO {
+            return nil;
+        }
+        if !return_type.is_null() {
+            let writable_type: BOOL =
+                msg_send![return_type, isEqualToString: NSPasteboardTypeString];
+            if writable_type == NO || !state.editable {
+                return nil;
+            }
+        }
+    }
+    let selection_exists = with_input_handler(this, |input| {
+        input
+            .selected_text_range(false)
+            .is_some_and(|selection| !selection.range.is_empty())
+    })
+    .unwrap_or(false);
+    if selection_exists {
+        this as *const Object as id
+    } else {
+        nil
+    }
+}
+
+extern "C" fn write_text_service_selection(this: &Object, _: Sel, pasteboard: id, _: id) -> BOOL {
+    let Some(state) = text_services_state(this) else {
+        return NO;
+    };
+    if !state.enabled {
+        return NO;
+    }
+    let selected = with_input_handler(this, |input| {
+        let range = input.selected_text_range(false)?.range;
+        if range.is_empty() {
+            return None;
+        }
+        let mut adjusted = None;
+        let text = input.text_for_range(range.clone(), &mut adjusted)?;
+        Some((adjusted.unwrap_or(range), text))
+    })
+    .flatten();
+    let Some((range, selected_text)) = selected else {
+        return NO;
+    };
+    unsafe {
+        let value = ns_string(&selected_text);
+        let success: BOOL = msg_send![pasteboard, setString: value forType: NSPasteboardTypeString];
+        if success == YES {
+            state.selection = Some((range, selected_text));
+        }
+        success
+    }
+}
+
+extern "C" fn read_text_service_selection(this: &Object, _: Sel, pasteboard: id) -> BOOL {
+    let Some(state) = text_services_state(this) else {
+        return NO;
+    };
+    if !state.enabled || !state.editable {
+        return NO;
+    }
+    let Some((range, original)) = state.selection.take() else {
+        return NO;
+    };
+    let replacement = unsafe {
+        let value: id = msg_send![pasteboard, stringForType: NSPasteboardTypeString];
+        if value.is_null() {
+            return NO;
+        }
+        value.to_str().to_string()
+    };
+    // Writing Tools may respond long after the menu closes. Never replace
+    // a different selection or a selection edited in the meantime.
+    let replaced = with_input_handler(this, |input| {
+        if input.selected_text_range(false).map(|s| s.range) != Some(range.clone()) {
+            return false;
+        }
+        let mut adjusted = None;
+        if input
+            .text_for_range(range.clone(), &mut adjusted)
+            .as_deref()
+            != Some(original.as_str())
+        {
+            return false;
+        }
+        input.replace_text_in_range(Some(range), &replacement);
+        true
+    })
+    .unwrap_or(false);
+    if replaced { YES } else { NO }
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {

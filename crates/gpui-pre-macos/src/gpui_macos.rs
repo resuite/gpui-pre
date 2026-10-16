@@ -56,6 +56,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
+pub use window::configure_text_services;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
